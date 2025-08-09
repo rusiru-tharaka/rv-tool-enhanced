@@ -120,3 +120,8 @@ htmlcov/
 # Local development
 backend_dev.pid
 frontend_dev.pid
+
+# Large pricing data files
+backend/app/services/bulk_pricing/offline_data/AmazonEC2_pricing.json
+backend/app/services/bulk_pricing/offline_data/*_pricing.json
+backend/app/services/pricing_cache/*.json
