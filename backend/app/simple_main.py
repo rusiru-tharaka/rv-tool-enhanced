@@ -138,54 +138,29 @@ def process_rvtools_data(file_content: bytes) -> List[Dict[str, Any]]:
         raise HTTPException(status_code=400, detail=f"Error processing RVTools file: {str(e)}")
 
 def calculate_aws_costs(vm_inventory: List[Dict[str, Any]], tco_parameters: Dict[str, Any]) -> Dict[str, Any]:
-    """Calculate AWS costs for VM inventory with proper RI and production/non-production handling"""
+    """Calculate AWS costs for VM inventory using LIVE AWS PRICING API - NO HARDCODED RATES"""
     
-    # AWS instance type mapping based on CPU/Memory with RI pricing
-    def get_instance_pricing(cpu: int, memory_gb: float, is_production: bool, ri_years: int = 3) -> tuple:
-        """Get instance type and pricing based on production status and RI settings"""
-        
-        # Determine instance type based on CPU/Memory
+    # Import live pricing service
+    from app.services.aws_live_pricing_service import aws_pricing_service
+    
+    def get_instance_type_from_specs(cpu: int, memory_gb: float) -> str:
+        """Determine AWS instance type based on CPU/Memory specs"""
         if cpu <= 1 and memory_gb <= 2:
-            instance_type = "t3.micro"
-            on_demand_hourly = 0.0104
+            return "t3.micro"
         elif cpu <= 1 and memory_gb <= 4:
-            instance_type = "t3.small"
-            on_demand_hourly = 0.0208
+            return "t3.small"
         elif cpu <= 2 and memory_gb <= 8:
-            instance_type = "t3.medium"
-            on_demand_hourly = 0.0416
+            return "t3.medium"
         elif cpu <= 2 and memory_gb <= 16:
-            instance_type = "m5.large"
-            on_demand_hourly = 0.096
+            return "m5.large"
         elif cpu <= 4 and memory_gb <= 16:
-            instance_type = "m5.xlarge"
-            on_demand_hourly = 0.192
+            return "m5.xlarge"
         elif cpu <= 8 and memory_gb <= 32:
-            instance_type = "m5.2xlarge"
-            on_demand_hourly = 0.384
+            return "m5.2xlarge"
         elif cpu <= 16 and memory_gb <= 64:
-            instance_type = "m5.4xlarge"
-            on_demand_hourly = 0.768
+            return "m5.4xlarge"
         else:
-            instance_type = "m5.8xlarge"
-            on_demand_hourly = 1.536
-        
-        # Calculate monthly cost
-        monthly_hours = 24 * 30  # 720 hours per month
-        on_demand_monthly = on_demand_hourly * monthly_hours
-        
-        # Apply Reserved Instance pricing for production VMs
-        if is_production and tco_parameters.get("production_pricing_model") in ["reserved_instance", "reserved"]:
-            # RI discount rates (approximate)
-            ri_discount_rates = {1: 0.25, 3: 0.40, 5: 0.50}  # 25%, 40%, 50% discount
-            discount = ri_discount_rates.get(ri_years, 0.40)
-            monthly_cost = on_demand_monthly * (1 - discount)
-            pricing_plan = f"{ri_years}-Year Reserved Instance"
-        else:
-            monthly_cost = on_demand_monthly
-            pricing_plan = "On-Demand"
-        
-        return instance_type, monthly_cost, pricing_plan
+            return "m5.8xlarge"
     
     def normalize_vm_data(vm: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize VM data structure to handle different formats"""
@@ -244,7 +219,16 @@ def calculate_aws_costs(vm_inventory: List[Dict[str, Any]], tco_parameters: Dict
     production_count = 0
     non_production_count = 0
     
+    # Get parameters
+    target_region = tco_parameters.get("target_region", "us-east-1")
     ri_years = tco_parameters.get("production_ri_years", 3)
+    production_pricing_model = tco_parameters.get("production_pricing_model", "on_demand")
+    
+    logger.info(f"Using LIVE AWS PRICING API for region: {target_region}")
+    logger.info(f"Production pricing model: {production_pricing_model}, RI years: {ri_years}")
+    
+    # Get live EBS pricing
+    ebs_price_per_gb = aws_pricing_service.get_ebs_pricing(target_region)
     
     for vm in vm_inventory:
         # Normalize VM data to handle different formats
@@ -261,15 +245,31 @@ def calculate_aws_costs(vm_inventory: List[Dict[str, Any]], tco_parameters: Dict
             production_count += 1
         else:
             non_production_count += 1
-            
-        instance_type, monthly_cost, pricing_plan = get_instance_pricing(
+        
+        # Determine instance type based on specs
+        instance_type = get_instance_type_from_specs(
             normalized_vm['current_cpu'], 
-            normalized_vm['current_memory_gb'],
-            is_production,
-            ri_years
+            normalized_vm['current_memory_gb']
         )
         
-        storage_cost = normalized_vm['current_storage_gb'] * 0.10  # $0.10/GB/month for EBS gp3
+        # Get LIVE AWS pricing - NO HARDCODED RATES
+        should_use_ri = (is_production and 
+                        production_pricing_model in ["reserved_instance", "reserved"])
+        
+        monthly_cost, pricing_plan, actual_discount = aws_pricing_service.get_instance_pricing_with_discount(
+            instance_type=instance_type,
+            is_production=should_use_ri,
+            ri_years=ri_years,
+            region=target_region
+        )
+        
+        # Calculate storage cost using live EBS pricing
+        storage_cost = normalized_vm['current_storage_gb'] * ebs_price_per_gb
+        
+        # Log the live pricing data
+        logger.info(f"VM: {normalized_vm['vm_name']} | Instance: {instance_type} | "
+                   f"Pricing: {pricing_plan} | Monthly: ${monthly_cost:.2f} | "
+                   f"Discount: {actual_discount:.1f}%")
         
         vm_estimate = {
             "vm_name": normalized_vm['vm_name'],
@@ -283,7 +283,8 @@ def calculate_aws_costs(vm_inventory: List[Dict[str, Any]], tco_parameters: Dict
             "pricing_plan": pricing_plan,
             "environment": environment,
             "operating_system": normalized_vm['operating_system'],
-            "region": tco_parameters.get("target_region", "us-east-1")
+            "region": target_region,
+            "live_aws_discount_rate": actual_discount  # Include actual discount rate
         }
         
         detailed_estimates.append(vm_estimate)
@@ -306,6 +307,13 @@ def calculate_aws_costs(vm_inventory: List[Dict[str, Any]], tco_parameters: Dict
     
     total_monthly_cost = total_infrastructure_cost + total_storage_cost + network_cost + observability_cost
     
+    logger.info(f"LIVE AWS PRICING CALCULATION COMPLETE:")
+    logger.info(f"  Infrastructure: ${total_infrastructure_cost:.2f}")
+    logger.info(f"  Storage (EBS): ${total_storage_cost:.2f}")
+    logger.info(f"  Network: ${network_cost:.2f}")
+    logger.info(f"  Observability: ${observability_cost:.2f}")
+    logger.info(f"  Total Monthly: ${total_monthly_cost:.2f}")
+    
     return {
         "detailed_estimates": detailed_estimates,
         "cost_summary": {
@@ -320,7 +328,9 @@ def calculate_aws_costs(vm_inventory: List[Dict[str, Any]], tco_parameters: Dict
             "production_vms": production_count,
             "non_production_vms": non_production_count
         },
-        "total_vms_analyzed": len(detailed_estimates)
+        "total_vms_analyzed": len(detailed_estimates),
+        "pricing_source": "live_aws_pricing_api",
+        "ebs_price_per_gb": ebs_price_per_gb
     }
 
 @app.post("/api/upload-rvtools")
