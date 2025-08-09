@@ -1,0 +1,403 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'RVTool Enhanced UX - Monitoring and Alerting Infrastructure'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'prod'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: Environment name
+  
+  ProjectName:
+    Type: String
+    Default: 'rvtool-enhanced'
+    Description: Project name for resource naming
+
+  AlertEmail:
+    Type: String
+    Description: Email address for alerts
+    Default: 'admin@example.com'
+
+Resources:
+  # SNS Topic for Alerts
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-alerts'
+      DisplayName: !Sub '${ProjectName} ${Environment} Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-alerts'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Subscription for Email Alerts
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertsTopic
+      Endpoint: !Ref AlertEmail
+
+  # CloudWatch Dashboard
+  ApplicationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-overview'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "app/${ProjectName}-${Environment}-alb/*" ],
+                  [ ".", "TargetResponseTime", ".", "." ],
+                  [ ".", "HTTPCode_Target_2XX_Count", ".", "." ],
+                  [ ".", "HTTPCode_Target_4XX_Count", ".", "." ],
+                  [ ".", "HTTPCode_Target_5XX_Count", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Application Load Balancer Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ECS", "CPUUtilization", "ServiceName", "${ProjectName}-${Environment}-backend-service", "ClusterName", "${ProjectName}-${Environment}-cluster" ],
+                  [ ".", "MemoryUtilization", ".", ".", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "ECS Service Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${ProjectName}-${Environment}-database" ],
+                  [ ".", "DatabaseConnections", ".", "." ],
+                  [ ".", "ReadLatency", ".", "." ],
+                  [ ".", "WriteLatency", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "RDS Database Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ElastiCache", "CPUUtilization", "CacheClusterId", "${ProjectName}-${Environment}-redis-001" ],
+                  [ ".", "NetworkBytesIn", ".", "." ],
+                  [ ".", "NetworkBytesOut", ".", "." ],
+                  [ ".", "CurrConnections", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "ElastiCache Redis Metrics",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+
+  # ALB High Response Time Alarm
+  ALBHighResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-alb-high-response-time'
+      AlarmDescription: 'ALB response time is too high'
+      MetricName: TargetResponseTime
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5.0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Sub
+            - '${LoadBalancerFullName}'
+            - LoadBalancerFullName:
+                Fn::ImportValue: !Sub '${ProjectName}-${Environment}-alb-arn'
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-alb-response-time'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ALB High 5XX Error Rate Alarm
+  ALBHigh5XXAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-alb-high-5xx-errors'
+      AlarmDescription: 'ALB 5XX error rate is too high'
+      MetricName: HTTPCode_Target_5XX_Count
+      Namespace: AWS/ApplicationELB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Sub
+            - '${LoadBalancerFullName}'
+            - LoadBalancerFullName:
+                Fn::ImportValue: !Sub '${ProjectName}-${Environment}-alb-arn'
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-alb-5xx-errors'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS High CPU Utilization Alarm
+  ECSHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-ecs-high-cpu'
+      AlarmDescription: 'ECS service CPU utilization is too high'
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value:
+            Fn::ImportValue: !Sub '${ProjectName}-${Environment}-backend-service-name'
+        - Name: ClusterName
+          Value:
+            Fn::ImportValue: !Sub '${ProjectName}-${Environment}-ecs-cluster-name'
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-ecs-cpu'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS High Memory Utilization Alarm
+  ECSHighMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-ecs-high-memory'
+      AlarmDescription: 'ECS service memory utilization is too high'
+      MetricName: MemoryUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value:
+            Fn::ImportValue: !Sub '${ProjectName}-${Environment}-backend-service-name'
+        - Name: ClusterName
+          Value:
+            Fn::ImportValue: !Sub '${ProjectName}-${Environment}-ecs-cluster-name'
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-ecs-memory'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # RDS High CPU Utilization Alarm
+  RDSHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-rds-high-cpu'
+      AlarmDescription: 'RDS database CPU utilization is too high'
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Sub '${ProjectName}-${Environment}-database'
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-rds-cpu'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # RDS High Connection Count Alarm
+  RDSHighConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-rds-high-connections'
+      AlarmDescription: 'RDS database connection count is too high'
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Sub '${ProjectName}-${Environment}-database'
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-rds-connections'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ElastiCache High CPU Utilization Alarm
+  ElastiCacheHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-elasticache-high-cpu'
+      AlarmDescription: 'ElastiCache Redis CPU utilization is too high'
+      MetricName: CPUUtilization
+      Namespace: AWS/ElastiCache
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 75
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: CacheClusterId
+          Value: !Sub '${ProjectName}-${Environment}-redis-001'
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-elasticache-cpu'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Composite Alarm for Application Health
+  ApplicationHealthAlarm:
+    Type: AWS::CloudWatch::CompositeAlarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-application-health'
+      AlarmDescription: 'Overall application health status'
+      AlarmRule: !Sub |
+        ALARM(${ALBHighResponseTimeAlarm}) OR 
+        ALARM(${ALBHigh5XXAlarm}) OR 
+        ALARM(${ECSHighCPUAlarm}) OR 
+        ALARM(${ECSHighMemoryAlarm}) OR 
+        ALARM(${RDSHighCPUAlarm}) OR 
+        ALARM(${ElastiCacheHighCPUAlarm})
+      AlarmActions:
+        - !Ref AlertsTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-app-health'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Insights Queries
+  ApplicationInsightsApplication:
+    Type: AWS::ApplicationInsights::Application
+    Properties:
+      ResourceGroupName: !Ref ApplicationResourceGroup
+      AutoConfigurationEnabled: true
+      AutoCreate: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-insights'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Resource Group for Application Insights
+  ApplicationResourceGroup:
+    Type: AWS::ResourceGroups::Group
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-resources'
+      Description: Resource group for RVTool Enhanced UX application
+      ResourceQuery:
+        Type: TAG_FILTERS_1_0
+        Query:
+          ResourceTypeFilters:
+            - AWS::ECS::Service
+            - AWS::ECS::Cluster
+            - AWS::ElasticLoadBalancingV2::LoadBalancer
+            - AWS::RDS::DBInstance
+            - AWS::ElastiCache::ReplicationGroup
+            - AWS::CloudFront::Distribution
+          TagFilters:
+            - Key: Project
+              Values:
+                - !Ref ProjectName
+            - Key: Environment
+              Values:
+                - !Ref Environment
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-resource-group'
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  AlertsTopicArn:
+    Description: SNS topic ARN for alerts
+    Value: !Ref AlertsTopic
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-alerts-topic-arn'
+
+  DashboardURL:
+    Description: CloudWatch dashboard URL
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ApplicationDashboard}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-dashboard-url'
+
+  ApplicationInsightsURL:
+    Description: Application Insights URL
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/systems-manager/appinsights/application/${ApplicationInsightsApplication}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-insights-url'

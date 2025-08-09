@@ -1,0 +1,323 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'RVTool Enhanced UX - Storage Infrastructure (S3 Buckets and ECR) - Fixed Version 5'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'prod'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: Environment name
+  
+  ProjectName:
+    Type: String
+    Default: 'rvtool-enhanced'
+    Description: Project name for resource naming
+
+Resources:
+  # CloudFront Origin Access Identity (must be created first)
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub 'OAI for ${ProjectName}-${Environment}-frontend'
+
+  # S3 Bucket for Frontend Static Website (Private, accessed via CloudFront only)
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-frontend-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-frontend'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket Policy for Frontend (CloudFront OAI only, no public access)
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: 
+      - FrontendBucket
+      - CloudFrontOriginAccessIdentity
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: CloudFrontOriginAccessIdentity
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOriginAccessIdentity}'
+            Action: 's3:GetObject'
+            Resource: !Sub 'arn:aws:s3:::${FrontendBucket}/*'
+
+  # S3 Bucket for File Uploads and Processing
+  FileStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-files-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-files'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket for Application Logs and Backups
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-logs-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ECR Repository for Backend Container Images
+  BackendECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-${Environment}-backend'
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["v"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Delete untagged images older than 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-backend-ecr'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for File Processing
+  FileProcessingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-${Environment}-file-processing'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-file-processing-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for S3 Access from ECS
+  S3AccessRole:
+    Type: AWS::IAM::Role
+    DependsOn:
+      - FileStorageBucket
+      - LogsBucket
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-s3-access-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3FileStorageAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${FileStorageBucket}/*'
+                  - !GetAtt FileStorageBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${LogsBucket}/*'
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-s3-access-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Policy for Bedrock Access
+  BedrockAccessPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn: S3AccessRole
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${Environment}-bedrock-access'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource:
+              - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-*'
+              - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-*'
+      Roles:
+        - !Ref S3AccessRole
+
+Outputs:
+  FrontendBucketName:
+    Description: Frontend S3 bucket name
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-frontend-bucket-name'
+
+  FrontendBucketDomainName:
+    Description: Frontend S3 bucket domain name
+    Value: !GetAtt FrontendBucket.DomainName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-frontend-bucket-domain'
+
+  FrontendBucketWebsiteURL:
+    Description: Frontend S3 bucket website URL
+    Value: !GetAtt FrontendBucket.WebsiteURL
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-frontend-bucket-website-url'
+
+  CloudFrontOriginAccessIdentityId:
+    Description: CloudFront Origin Access Identity ID
+    Value: !Ref CloudFrontOriginAccessIdentity
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-cloudfront-oai-id'
+
+  FileStorageBucketName:
+    Description: File storage S3 bucket name
+    Value: !Ref FileStorageBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-files-bucket-name'
+
+  FileStorageBucketArn:
+    Description: File storage S3 bucket ARN
+    Value: !GetAtt FileStorageBucket.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-files-bucket-arn'
+
+  LogsBucketName:
+    Description: Logs S3 bucket name
+    Value: !Ref LogsBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-logs-bucket-name'
+
+  BackendECRRepositoryURI:
+    Description: Backend ECR repository URI
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendECRRepository}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-backend-ecr-uri'
+
+  S3AccessRoleArn:
+    Description: S3 access role ARN
+    Value: !GetAtt S3AccessRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-s3-access-role-arn'

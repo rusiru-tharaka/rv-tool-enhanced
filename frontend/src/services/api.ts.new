@@ -1,0 +1,471 @@
+import axios, { AxiosInstance, AxiosResponse, AxiosError } from 'axios';
+import * as XLSX from 'xlsx';
+import { 
+  AnalysisSession, 
+  MigrationScopeAnalysis, 
+  MigrationBlocker, 
+  CostEstimatesAnalysis, 
+  VMCostEstimate,
+  ModernizationAnalysis,
+  TCOParameters,
+  PaginatedResponse,
+  FilterOptions,
+  PhaseAdvanceResponse
+} from '../types';
+
+class ApiService {
+  private api: AxiosInstance;
+  
+  constructor() {
+    // Create Axios instance with base URL and default config
+    this.api = axios.create({
+      baseURL: process.env.REACT_APP_API_URL || 'http://localhost:8001',
+      timeout: 30000,
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      }
+    });
+    
+    // Add response interceptor for error handling
+    this.api.interceptors.response.use(
+      response => response,
+      this.handleApiError
+    );
+    
+    console.log('API Service initialized with base URL:', this.api.defaults.baseURL);
+  }
+  
+  private handleApiError(error: AxiosError): Promise<never> {
+    if (error.response) {
+      // Server responded with an error status
+      return Promise.reject({
+        error: error.response.data?.error || 'Server Error',
+        message: error.response.data?.message || 'An error occurred',
+        details: error.response.data?.details,
+        timestamp: new Date().toISOString(),
+      });
+    } else if (error.request) {
+      // Request made but no response
+      return Promise.reject({
+        error: 'Network Error',
+        message: 'Unable to connect to AWS backend server. Please check your network connection and try again.',
+        timestamp: new Date().toISOString(),
+      });
+    } else {
+      // Something else happened
+      return Promise.reject({
+        error: 'Unknown Error',
+        message: error.message || 'An unexpected error occurred',
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  // ============================================================================
+  // FILE UPLOAD
+  // ============================================================================
+
+  async uploadRVToolsFile(file: File): Promise<{ success: boolean; vm_inventory: any[]; total_vms: number }> {
+    try {
+      // Parse Excel file client-side to extract VM inventory
+      const vmInventory = await this.parseRVToolsFile(file);
+      
+      console.log('Sending VM inventory to AWS backend:', {
+        count: vmInventory.length,
+        sample: vmInventory[0]
+      });
+      
+      // Call the AWS backend analyze-tco endpoint with the parsed data
+      try {
+        const response: AxiosResponse = await this.api.post('/analyze-tco', {
+          vm_inventory: vmInventory,
+          migration_timeline: '12_months',
+          optimization_level: 'balanced'
+        });
+
+        console.log('AWS backend response:', response.data);
+
+        // Return the VM inventory for session creation
+        return {
+          success: true,
+          vm_inventory: vmInventory,
+          total_vms: vmInventory.length
+        };
+      } catch (error) {
+        console.error('AWS backend error:', error);
+        throw error;
+      }
+    } catch (error: any) {
+      console.error('Error uploading RVTools file:', error);
+      throw error;
+    }
+  }
+  
+  private parseRVToolsFile(file: File): Promise<any[]> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      
+      reader.onload = async (e) => {
+        try {
+          const data = new Uint8Array(e.target?.result as ArrayBuffer);
+          const workbook = XLSX.read(data, { type: 'array' });
+          
+          // Check if the file has the expected sheets
+          const expectedSheets = ['vInfo', 'vHost', 'vCluster', 'vDatastore'];
+          const hasExpectedSheets = expectedSheets.some(sheet => workbook.SheetNames.includes(sheet));
+          
+          if (!hasExpectedSheets) {
+            reject(new Error('Invalid RVTools file format. Expected sheets not found.'));
+            return;
+          }
+          
+          // Process vInfo sheet which contains VM information
+          const vInfoSheet = workbook.Sheets['vInfo'] || workbook.Sheets[workbook.SheetNames[0]];
+          
+          if (!vInfoSheet) {
+            reject(new Error('Could not find VM information sheet in the Excel file.'));
+            return;
+          }
+          
+          // Convert sheet to JSON
+          XLSX.utils.sheet_to_json(vInfoSheet, { raw: false, defval: '' })
+            .then((rows: any[]) => {
+              // Process VM data
+              const vmInventory = rows.map((row: any) => {
+                // Extract VM name
+                const vmName = row['VM'] || row['Name'] || '';
+                if (!vmName) {
+                  return null; // Skip rows without VM name
+                }
+                
+                // Extract CPU count
+                const cpuCount = parseInt(row['CPUs'] || row['CPU'] || '0', 10) || 2;
+                
+                // Extract memory in MB
+                const memoryStr = row['Memory'] || row['Memory MB'] || '4096';
+                const memoryMB = parseInt(memoryStr.replace(/[^\d.-]/g, ''), 10) || 4096;
+                
+                // Extract disk size in GB
+                const diskStr = row['Provisioned MB'] || row['Total Storage MB'] || row['Disk GB'] || '100000';
+                const diskMB = parseInt(diskStr.replace(/[^\d.-]/g, ''), 10) || 100000;
+                const diskGB = Math.ceil(diskMB / 1024) || 100;
+                
+                // Extract OS information
+                const osInfo = row['OS according to the configuration file'] || 
+                              row['Guest OS'] || 
+                              row['OS'] || 
+                              'Unknown';
+                
+                // Determine OS type
+                let osType = 'Unknown';
+                if (osInfo.toLowerCase().includes('windows')) {
+                  osType = 'Windows';
+                } else if (osInfo.toLowerCase().includes('linux') || 
+                          osInfo.toLowerCase().includes('centos') || 
+                          osInfo.toLowerCase().includes('ubuntu') || 
+                          osInfo.toLowerCase().includes('red hat')) {
+                  osType = 'Linux';
+                }
+                
+                // Extract power state
+                const powerState = row['Powerstate'] || row['Power State'] || 'poweredOn';
+                
+                // Extract creation date or determine age
+                let creationDate = null;
+                const creationDateStr = row['Creation Date'] || row['Created'] || '';
+                if (creationDateStr) {
+                  try {
+                    creationDate = new Date(creationDateStr).toISOString();
+                  } catch (e) {
+                    creationDate = null;
+                  }
+                }
+                
+                // Create VM data object
+                return {
+                  vm_name: vmName,
+                  cpu_count: cpuCount,
+                  memory_mb: memoryMB,
+                  disk_gb: diskGB,
+                  os_info: osInfo,
+                  os_type: osType,
+                  power_state: powerState,
+                  host: parseString(row['Host'] || row['ESX Host'] || row['ESX Server'], 'Unknown'),
+                  cluster: parseString(row['Cluster'] || row['Cluster Name'], 'Unknown'),
+                  datacenter: parseString(row['Datacenter'] || row['Datacenter Name'], 'Unknown'),
+                  creation_date: creationDate // Add creation date to VM data
+                };
+
+                // Validate the VM data
+                if (vmData.cpu_count < 1 || vmData.cpu_count > 128) vmData.cpu_count = 2;
+                if (vmData.memory_mb < 512 || vmData.memory_mb > 1048576) vmData.memory_mb = 4096;
+                if (vmData.disk_gb < 1 || vmData.disk_gb > 16384) vmData.disk_gb = 100;
+
+                return vmData;
+              });
+            
+            console.log(`Parsed ${vmInventory.length} valid VMs from RVTools file`);
+            console.log('Sample parsed VM:', vmInventory[0]);
+            
+            if (vmInventory.length === 0) {
+              reject(new Error('No valid VM data found in Excel file. Please check the file format.'));
+              return;
+            }
+            
+            resolve(vmInventory);
+          }).catch(reject);
+        } catch (error) {
+          console.error('Error parsing Excel file:', error);
+          reject(error);
+        }
+      };
+      
+      reader.onerror = () => reject(new Error('Failed to read file'));
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  // ============================================================================
+  // SESSION MANAGEMENT
+  // ============================================================================
+
+  async createSession(vmInventory: any[]): Promise<AnalysisSession> {
+    try {
+      // Convert to direct analysis format
+      const response: AxiosResponse<any> = await this.api.post('/analyze-tco', {
+        vm_inventory: vmInventory,
+        migration_timeline: '12_months',
+        optimization_level: 'balanced'
+      });
+      
+      // Convert direct analysis response to session format for compatibility
+      const sessionId = `direct-${Date.now()}`;
+      
+      const session: AnalysisSession = {
+        session_id: sessionId,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        status: 'active',
+        current_phase: 1,
+        vm_inventory: vmInventory,
+        total_vms: vmInventory.length,
+        analysis_results: response.data
+      };
+      
+      // Store session in local storage for persistence
+      localStorage.setItem(`session_${sessionId}`, JSON.stringify(session));
+      
+      return session;
+    } catch (error: any) {
+      console.error('Error creating session:', error);
+      throw error;
+    }
+  }
+
+  async getSession(sessionId: string): Promise<AnalysisSession | null> {
+    try {
+      // For direct analysis, retrieve from local storage
+      const sessionData = localStorage.getItem(`session_${sessionId}`);
+      if (sessionData) {
+        return JSON.parse(sessionData);
+      }
+      
+      // If not in local storage, try to get from API
+      const response: AxiosResponse<AnalysisSession> = await this.api.get(`/sessions/${sessionId}`);
+      return response.data;
+    } catch (error) {
+      console.error(`Error getting session ${sessionId}:`, error);
+      return null;
+    }
+  }
+
+  async listSessions(): Promise<AnalysisSession[]> {
+    try {
+      // For direct analysis, retrieve all sessions from local storage
+      const sessions: AnalysisSession[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith('session_')) {
+          const sessionData = localStorage.getItem(key);
+          if (sessionData) {
+            sessions.push(JSON.parse(sessionData));
+          }
+        }
+      }
+      
+      return sessions;
+    } catch (error) {
+      console.error('Error listing sessions:', error);
+      return [];
+    }
+  }
+
+  async advancePhase(sessionId: string): Promise<PhaseAdvanceResponse> {
+    // Direct analysis completes all phases immediately
+    return {
+      session_id: sessionId,
+      previous_phase: 3,
+      current_phase: 4,
+      status: 'completed',
+      message: 'All phases completed in direct analysis mode'
+    };
+  }
+
+  // ============================================================================
+  // MIGRATION SCOPE ANALYSIS
+  // ============================================================================
+
+  async analyzeMigrationScope(sessionId: string): Promise<MigrationScopeAnalysis> {
+    // In direct analysis mode, return mock data or extract from session results
+    return {
+      session_id: sessionId,
+      total_vms: 0,
+      migration_ready: 0,
+      blockers_found: 0,
+      analysis_complete: true,
+      blockers: [],
+      summary: {
+        ready_percentage: 100,
+        critical_blockers: 0,
+        warning_blockers: 0,
+        info_blockers: 0
+      }
+    };
+  }
+
+  async getMigrationBlockers(
+    sessionId: string,
+    filters: FilterOptions = {}
+  ): Promise<PaginatedResponse<MigrationBlocker>> {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value !== undefined && value !== null) {
+        params.append(key, value.toString());
+      }
+    });
+
+    const response: AxiosResponse<PaginatedResponse<MigrationBlocker>> = await this.api.get(
+      `/migration-scope/blockers/${sessionId}?${params}`
+    );
+    return response.data;
+  }
+
+  async getMigrationScopeSummary(sessionId: string): Promise<any> {
+    const response: AxiosResponse = await this.api.get(`/migration-scope/blockers/${sessionId}/summary`);
+    return response.data;
+  }
+
+  async getWorkloadClassifications(sessionId: string): Promise<any> {
+    const response: AxiosResponse = await this.api.get(`/migration-scope/workload-classifications/${sessionId}`);
+    return response.data;
+  }
+
+  async getInfrastructureInsights(sessionId: string): Promise<any> {
+    const response: AxiosResponse = await this.api.get(`/migration-scope/infrastructure-insights/${sessionId}`);
+    return response.data;
+  }
+
+  async exportMigrationScope(sessionId: string, format: 'json' | 'csv' = 'json'): Promise<any> {
+    const response: AxiosResponse = await this.api.get(`/migration-scope/export/${sessionId}?format=${format}`);
+    return response.data;
+  }
+
+  // ============================================================================
+  // COST ESTIMATES
+  // ============================================================================
+
+  async analyzeCostEstimates(sessionId: string, tcoParameters?: TCOParameters): Promise<CostEstimatesAnalysis> {
+    // In direct analysis mode, return mock data
+    return {
+      session_id: sessionId,
+      current_monthly_cost: 10000,
+      projected_aws_cost: 7500,
+      estimated_savings: 2500,
+      savings_percentage: 25,
+      analysis_complete: true,
+      cost_breakdown: {
+        compute: 5000,
+        storage: 2000,
+        network: 500
+      },
+      vm_cost_estimates: []
+    };
+  }
+
+  async getDetailedCostEstimates(
+    sessionId: string,
+    filters: FilterOptions = {}
+  ): Promise<PaginatedResponse<VMCostEstimate>> {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value !== undefined && value !== null) {
+        params.append(key, value.toString());
+      }
+    });
+
+    const response: AxiosResponse<PaginatedResponse<VMCostEstimate>> = await this.api.get(
+      `/cost-estimates/detailed/${sessionId}?${params}`
+    );
+    return response.data;
+  }
+
+  async getCostSummary(sessionId: string): Promise<any> {
+    const response: AxiosResponse = await this.api.get(`/cost-estimates/summary/${sessionId}`);
+    return response.data;
+  }
+
+  async updateTCOParameters(sessionId: string, tcoParameters: TCOParameters): Promise<CostEstimatesAnalysis> {
+    const response: AxiosResponse<CostEstimatesAnalysis> = await this.api.put(
+      `/cost-estimates/parameters/${sessionId}`,
+      tcoParameters
+    );
+    return response.data;
+  }
+
+  async exportCostEstimates(sessionId: string, format: 'json' | 'csv' = 'json'): Promise<any> {
+    const response: AxiosResponse = await this.api.get(`/cost-estimates/export/${sessionId}?format=${format}`);
+    return response.data;
+  }
+
+  async getPricingInfo(region: string, instanceTypes?: string): Promise<any> {
+    const params = instanceTypes ? `?instance_types=${instanceTypes}` : '';
+    const response: AxiosResponse = await this.api.get(`/cost-estimates/pricing-info/${region}${params}`);
+    return response.data;
+  }
+
+  // ============================================================================
+  // MODERNIZATION
+  // ============================================================================
+
+  async analyzeModernization(sessionId: string): Promise<ModernizationAnalysis> {
+    try {
+      // Make an API call to the AWS backend endpoint
+      const awsBackendUrl = "http://rvtool-alb-dev-1648331028.us-east-1.elb.amazonaws.com";
+      const response: AxiosResponse = await axios.post(`${awsBackendUrl}/analyze-modernization`, {
+        session_id: sessionId
+      });
+      
+      return response.data;
+    } catch (error) {
+      // Log the error for debugging
+      console.error('API Response Error:', error.response);
+      console.error('Error Status:', error.response?.status);
+      console.error('Error Headers:', error.response?.headers);
+      console.error('Error Data:', error.response?.data);
+      
+      // For production, return a structured error response
+      throw new Error(`Modernization analysis failed: ${error.response?.data?.detail || error.message}`);
+    }
+  }
+}
+
+// Helper function to parse string values
+function parseString(value: any, defaultValue: string = ''): string {
+  if (value === undefined || value === null) return defaultValue;
+  return String(value).trim() || defaultValue;
+}
+
+// Create and export a singleton instance
+const apiService = new ApiService();
+export default apiService;

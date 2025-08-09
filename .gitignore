@@ -1,0 +1,122 @@
+# Dependencies
+node_modules/
+*/node_modules/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+.nyc_output/
+
+# Dependency directories
+jspm_packages/
+
+# Optional npm cache directory
+.npm
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# dotenv environment variables file
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+
+# Cache directories
+.cache/
+.vite/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Development files
+console-log.txt
+img*.PNG
+img*.png
+img*.jpg
+img*.jpeg
+scratchboard*.md
+SCRATCHBOARD*.md
+*SCRATCHBOARD*.md
+*scratchboard*.md
+deployment-scratchboard.md
+
+# Test files
+test_*.csv
+*_test.*
+*.test.*
+
+# Sample data files (keep one for reference)
+# RVTools_Sample_*.xlsx
+
+# Python specific
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# AWS and deployment
+.aws/
+*.pem
+*.key
+
+# Local development
+backend_dev.pid
+frontend_dev.pid

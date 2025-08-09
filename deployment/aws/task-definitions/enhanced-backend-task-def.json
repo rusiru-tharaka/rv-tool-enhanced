@@ -1,0 +1,71 @@
+{
+  "family": "rvtool-enhanced-backend",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::783764609930:role/rvtool-ecs-execution-role-dev",
+  "taskRoleArn": "arn:aws:iam::783764609930:role/rvtool-ecs-task-role-dev",
+  "containerDefinitions": [
+    {
+      "name": "rvtool-enhanced-backend",
+      "image": "783764609930.dkr.ecr.us-east-1.amazonaws.com/rvtool-api:enhanced-session",
+      "portMappings": [
+        {
+          "containerPort": 8001,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "DATABASE_HOST",
+          "value": "rvtool-dev-db.cnqaaqqw4215.us-east-1.rds.amazonaws.com"
+        },
+        {
+          "name": "DATABASE_PORT",
+          "value": "5432"
+        },
+        {
+          "name": "DATABASE_NAME",
+          "value": "rvtool"
+        },
+        {
+          "name": "DATABASE_USER",
+          "value": "rvtool_admin"
+        },
+        {
+          "name": "DATABASE_PASSWORD",
+          "value": "4!n<I{D>#8_h-Okr9!pT']$z[gVX}F&-"
+        },
+        {
+          "name": "AWS_REGION",
+          "value": "us-east-1"
+        },
+        {
+          "name": "ENVIRONMENT",
+          "value": "production"
+        },
+        {
+          "name": "LOG_LEVEL",
+          "value": "INFO"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/rvtool-enhanced-backend",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "essential": true
+    }
+  ]
+}

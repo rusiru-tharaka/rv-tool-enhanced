@@ -1,0 +1,277 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'RVTool Enhanced UX - Database and Caching Infrastructure'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'prod'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: Environment name
+  
+  ProjectName:
+    Type: String
+    Default: 'rvtool-enhanced'
+    Description: Project name for resource naming
+
+  DatabaseInstanceClass:
+    Type: String
+    Default: 'db.t3.micro'
+    AllowedValues: ['db.t3.micro', 'db.t3.small', 'db.t3.medium', 'db.r5.large']
+    Description: RDS instance class
+
+  DatabaseAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+    Description: Database allocated storage in GB
+
+  RedisNodeType:
+    Type: String
+    Default: 'cache.t3.micro'
+    AllowedValues: ['cache.t3.micro', 'cache.t3.small', 'cache.t3.medium', 'cache.r5.large']
+    Description: ElastiCache Redis node type
+
+Resources:
+  # Database Subnet Group
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-${Environment}-db-subnet-group'
+      DBSubnetGroupDescription: Subnet group for RDS database
+      SubnetIds:
+        - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-private-subnet-1-id'
+        - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-private-subnet-2-id'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-db-subnet-group'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Database Parameter Group
+  DatabaseParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Family: postgres15
+      Description: Parameter group for RVTool Enhanced PostgreSQL
+      Parameters:
+        shared_preload_libraries: 'pg_stat_statements'
+        log_statement: 'all'
+        log_min_duration_statement: 1000
+        max_connections: 100
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-db-params'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Database Master Password Secret
+  DatabaseMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-db-master-password'
+      Description: Master password for RVTool Enhanced database
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "rvtool_admin"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-db-secret'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # RDS PostgreSQL Database
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-${Environment}-database'
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      Engine: postgres
+      EngineVersion: '15.4'
+      AllocatedStorage: !Ref DatabaseAllocatedStorage
+      StorageType: gp2
+      StorageEncrypted: true
+      
+      DBName: rvtool_enhanced
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DatabaseMasterSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DatabaseMasterSecret}:SecretString:password}}'
+      
+      VPCSecurityGroups:
+        - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-db-sg-id'
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      DBParameterGroupName: !Ref DatabaseParameterGroup
+      
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      
+      MultiAZ: !If [IsProd, true, false]
+      PubliclyAccessible: false
+      DeletionProtection: !If [IsProd, true, false]
+      
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt DatabaseMonitoringRole.Arn
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-database'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Database Monitoring Role
+  DatabaseMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-db-monitoring-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-db-monitoring-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ElastiCache Subnet Group
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !Sub '${ProjectName}-${Environment}-redis-subnet-group'
+      Description: Subnet group for ElastiCache Redis
+      SubnetIds:
+        - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-private-subnet-1-id'
+        - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-private-subnet-2-id'
+
+  # ElastiCache Parameter Group
+  RedisParameterGroup:
+    Type: AWS::ElastiCache::ParameterGroup
+    Properties:
+      CacheParameterGroupFamily: redis7
+      Description: Parameter group for RVTool Enhanced Redis
+      Properties:
+        maxmemory-policy: allkeys-lru
+        timeout: 300
+
+  # ElastiCache Redis Cluster
+  RedisCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub '${ProjectName}-${Environment}-redis'
+      ReplicationGroupDescription: Redis cluster for RVTool Enhanced session management
+      
+      NodeType: !Ref RedisNodeType
+      Engine: redis
+      EngineVersion: '7.0'
+      
+      NumCacheClusters: 2
+      MultiAZEnabled: true
+      AutomaticFailoverEnabled: true
+      
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      CacheParameterGroupName: !Ref RedisParameterGroup
+      SecurityGroupIds:
+        - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-redis-sg-id'
+      
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      
+      SnapshotRetentionLimit: 3
+      SnapshotWindow: '03:00-05:00'
+      PreferredMaintenanceWindow: 'sun:05:00-sun:07:00'
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-redis'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Application Database User Secret
+  ApplicationDatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-app-db-credentials'
+      Description: Application database credentials for RVTool Enhanced
+      SecretString: !Sub |
+        {
+          "username": "rvtool_app",
+          "password": "temp_password_to_be_updated",
+          "engine": "postgres",
+          "host": "${Database.Endpoint.Address}",
+          "port": ${Database.Endpoint.Port},
+          "dbname": "rvtool_enhanced",
+          "dbInstanceIdentifier": "${Database}"
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-app-db-secret'
+        - Key: Environment
+          Value: !Ref Environment
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, 'prod']
+
+Outputs:
+  DatabaseEndpoint:
+    Description: RDS PostgreSQL endpoint
+    Value: !GetAtt Database.Endpoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-db-endpoint'
+
+  DatabasePort:
+    Description: RDS PostgreSQL port
+    Value: !GetAtt Database.Endpoint.Port
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-db-port'
+
+  DatabaseName:
+    Description: Database name
+    Value: rvtool_enhanced
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-db-name'
+
+  DatabaseMasterSecretArn:
+    Description: Database master secret ARN
+    Value: !Ref DatabaseMasterSecret
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-db-master-secret-arn'
+
+  ApplicationDatabaseSecretArn:
+    Description: Application database secret ARN
+    Value: !Ref ApplicationDatabaseSecret
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-app-db-secret-arn'
+
+  RedisEndpoint:
+    Description: ElastiCache Redis primary endpoint
+    Value: !GetAtt RedisCluster.PrimaryEndPoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-redis-endpoint'
+
+  RedisPort:
+    Description: ElastiCache Redis port
+    Value: !GetAtt RedisCluster.PrimaryEndPoint.Port
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-redis-port'
+
+  RedisReaderEndpoint:
+    Description: ElastiCache Redis reader endpoint
+    Value: !GetAtt RedisCluster.ReaderEndPoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-redis-reader-endpoint'

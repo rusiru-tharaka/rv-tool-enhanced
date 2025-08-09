@@ -1,0 +1,2768 @@
+"""
+Cost Estimates Service
+Comprehensive TCO calculation service combining AWS pricing and instance recommendations
+Provides detailed cost analysis for VM migration to AWS
+"""
+
+import logging
+from typing import Dict, List, Optional, Tuple, Any
+from datetime import datetime
+import asyncio
+import math
+
+from .aws_pricing_service import pricing_service, InstancePricing, StoragePricing
+from .instance_recommendation_service import (
+    recommendation_service, 
+    VMSpecification, 
+    InstanceRecommendation, 
+    WorkloadType
+)
+from ..models.core_models import (
+    TCOParameters, 
+    VMCostEstimate, 
+    CostSummary, 
+    CostEstimatesAnalysis
+)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Official RVTools Column Mapping (based on RVTools 4.7.1 documentation)
+RVTOOLS_COLUMNS = {
+    'vm_name': 'VM',
+    'cpu_cores': 'CPUs', 
+    'memory_mib': 'Memory',
+    'storage_provisioned_mib': 'Provisioned MiB',
+    'storage_used_mib': 'In Use MiB',
+    'os_type': 'OS according to the configuration file',
+    'power_state': 'Powerstate',
+    'datacenter': 'Datacenter',
+    'cluster': 'Cluster',
+    'host': 'Host'
+}
+
+class CostEstimatesService:
+    """
+    Service for calculating comprehensive AWS migration cost estimates
+    Combines instance recommendations with real-time AWS pricing
+    """
+    
+    def __init__(self):
+        self.pricing_service = pricing_service
+        self.recommendation_service = recommendation_service
+        logger.info("Cost Estimates Service initialized")
+    
+    def _convert_mib_to_gb(self, mib_value: float) -> float:
+        """Convert MiB to GB: 1 MiB = 1.048576 MB, 1 GB = 1024 MB"""
+        if mib_value <= 0:
+            return 0.0
+        return (mib_value * 1.048576) / 1024
+        
+    def _convert_mib_to_mb(self, mib_value: float) -> float:
+        """Convert MiB to MB: 1 MiB = 1.048576 MB"""
+        if mib_value <= 0:
+            return 0.0
+        return mib_value * 1.048576
+        
+    def _safe_get_numeric_value(self, vm_data: Dict, column_name: str, default: float = 0.0) -> float:
+        """Safely extract numeric value from VM data"""
+        try:
+            value = vm_data.get(column_name, default)
+            return float(value) if value is not None else default
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid numeric value for column '{column_name}': {vm_data.get(column_name)}, using default: {default}")
+            return default
+    
+    async def analyze_cost_estimates(
+        self, 
+        session_id: str, 
+        vm_inventory: List[Dict], 
+        tco_parameters: TCOParameters
+    ) -> CostEstimatesAnalysis:
+        """
+        Perform comprehensive cost analysis for VM inventory with optimized processing
+        """
+        logger.info(f"Starting cost analysis for session {session_id} with {len(vm_inventory)} VMs")
+        
+        try:
+            # Convert VM inventory to specifications with validation
+            vm_specs = await self._convert_inventory_to_specs_async(vm_inventory)
+            logger.info(f"Converted {len(vm_specs)} VMs to specifications")
+            
+            # Filter VMs based on TCO parameters
+            filtered_specs = self._filter_vms_by_parameters(vm_specs, tco_parameters)
+            logger.info(f"Filtered to {len(filtered_specs)} VMs based on parameters")
+            
+            # Generate instance recommendations in batches for performance
+            logger.info("Generating instance recommendations...")
+            recommendations = await self._generate_recommendations_batch(filtered_specs)
+            
+            # Get pricing for all recommended instances with caching
+            logger.info("Fetching AWS pricing data...")
+            instance_types = list(set(rec.instance_type for rec in recommendations))
+            pricing_data = await self.pricing_service.get_multiple_instance_pricing_cached(
+                instance_types, 
+                tco_parameters.target_region
+            )
+            
+            # Get storage pricing with caching
+            storage_pricing = await self.pricing_service.get_storage_pricing_cached(
+                "gp3", 
+                tco_parameters.target_region
+            )
+            
+            # Calculate detailed cost estimates with parallel processing
+            logger.info("Calculating detailed cost estimates...")
+            detailed_estimates = await self._calculate_detailed_estimates_parallel(
+                filtered_specs, 
+                recommendations, 
+                pricing_data, 
+                storage_pricing, 
+                tco_parameters
+            )
+            
+            # Calculate cost summary with enhanced metrics
+            cost_summary = self._calculate_enhanced_cost_summary(detailed_estimates, tco_parameters)
+            
+            # Create analysis result with metadata
+            analysis = CostEstimatesAnalysis(
+                session_id=session_id,
+                tco_parameters=tco_parameters,
+                cost_summary=cost_summary,
+                detailed_estimates=detailed_estimates,
+                total_vms_analyzed=len(vm_specs),
+                filtered_vms_count=len(filtered_specs),
+                analysis_timestamp=datetime.utcnow(),
+                processing_time_seconds=0  # Will be calculated by caller
+            )
+            
+            logger.info(f"Cost analysis completed for session {session_id}: ${cost_summary.total_monthly_cost:.2f}/month")
+            return analysis
+            
+        except Exception as e:
+            logger.error(f"Cost analysis failed for session {session_id}: {e}")
+            raise RuntimeError(f"Cost analysis failed: {e}")
+    
+    async def _convert_inventory_to_specs_async(self, vm_inventory: List[Dict]) -> List[VMSpecification]:
+        """Convert VM inventory to specifications with async processing"""
+        specs = []
+        
+        for vm_data in vm_inventory:
+            try:
+                # Extract VM specifications with enhanced validation
+                vm_name = vm_data.get('VM', vm_data.get('vm_name', 'Unknown'))
+                cpu_cores = self._safe_get_numeric_value(vm_data, 'CPUs', 1)
+                memory_mib = self._safe_get_numeric_value(vm_data, 'Memory', 1024)
+                storage_used_mib = self._safe_get_numeric_value(vm_data, 'In Use MiB', 10240)
+                
+                # Convert memory from MiB to GB
+                memory_gb = self._convert_mib_to_gb(memory_mib)
+                storage_gb = self._convert_mib_to_gb(storage_used_mib)
+                
+                # Determine OS type with enhanced detection
+                os_type = self._determine_os_type(vm_data)
+                
+                # Determine workload type based on VM characteristics
+                workload_type = self._determine_workload_type(vm_data, cpu_cores, memory_gb)
+                
+                spec = VMSpecification(
+                    vm_name=vm_name,
+                    cpu_cores=int(cpu_cores),
+                    memory_gb=memory_gb,
+                    storage_gb=storage_gb,
+                    os_type=os_type,
+                    workload_type=workload_type,
+                    power_state=vm_data.get('Powerstate', 'poweredOn'),
+                    cluster=vm_data.get('Cluster', 'Unknown'),
+                    datacenter=vm_data.get('Datacenter', 'Unknown')
+                )
+                
+                specs.append(spec)
+                
+            except Exception as e:
+                logger.warning(f"Failed to process VM {vm_data.get('VM', 'Unknown')}: {e}")
+                continue
+        
+        return specs
+    
+    def _filter_vms_by_parameters(self, vm_specs: List[VMSpecification], tco_parameters: TCOParameters) -> List[VMSpecification]:
+        """Filter VMs based on TCO parameters"""
+        filtered_specs = []
+        
+        for spec in vm_specs:
+            # Skip powered off VMs if configured
+            if tco_parameters.exclude_poweroff_vms and spec.power_state != 'poweredOn':
+                continue
+            
+            # Additional filtering logic can be added here
+            filtered_specs.append(spec)
+        
+        return filtered_specs
+    
+    async def _generate_recommendations_batch(self, vm_specs: List[VMSpecification]) -> List[InstanceRecommendation]:
+        """Generate instance recommendations in batches for better performance"""
+        batch_size = 50  # Process 50 VMs at a time
+        recommendations = []
+        
+        for i in range(0, len(vm_specs), batch_size):
+            batch = vm_specs[i:i + batch_size]
+            batch_recommendations = self.recommendation_service.recommend_multiple_instances(batch)
+            recommendations.extend(batch_recommendations)
+            
+            # Small delay to prevent overwhelming the system
+            if i + batch_size < len(vm_specs):
+                await asyncio.sleep(0.1)
+        
+        return recommendations
+    
+    async def _calculate_detailed_estimates_parallel(
+        self,
+        vm_specs: List[VMSpecification],
+        recommendations: List[InstanceRecommendation],
+        pricing_data: Dict[str, InstancePricing],
+        storage_pricing: StoragePricing,
+        tco_parameters: TCOParameters
+    ) -> List[VMCostEstimate]:
+        """Calculate detailed cost estimates with parallel processing"""
+        
+        # Create recommendation lookup for performance
+        rec_lookup = {rec.vm_name: rec for rec in recommendations}
+        
+        # Process estimates in parallel batches
+        batch_size = 20
+        all_estimates = []
+        
+        for i in range(0, len(vm_specs), batch_size):
+            batch = vm_specs[i:i + batch_size]
+            batch_tasks = []
+            
+            for spec in batch:
+                task = self._calculate_single_vm_estimate(
+                    spec, 
+                    rec_lookup.get(spec.vm_name),
+                    pricing_data,
+                    storage_pricing,
+                    tco_parameters
+                )
+                batch_tasks.append(task)
+            
+            # Process batch in parallel
+            batch_estimates = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            
+            # Filter out exceptions and add valid estimates
+            for estimate in batch_estimates:
+                if isinstance(estimate, VMCostEstimate):
+                    all_estimates.append(estimate)
+                elif isinstance(estimate, Exception):
+                    logger.warning(f"Failed to calculate estimate: {estimate}")
+        
+        return all_estimates
+    
+    async def _calculate_single_vm_estimate(
+        self,
+        spec: VMSpecification,
+        recommendation: Optional[InstanceRecommendation],
+        pricing_data: Dict[str, InstancePricing],
+        storage_pricing: StoragePricing,
+        tco_parameters: TCOParameters
+    ) -> VMCostEstimate:
+        """Calculate cost estimate for a single VM"""
+        
+        if not recommendation:
+            # Fallback recommendation if none provided
+            recommendation = self.recommendation_service.recommend_instance(spec)
+        
+        instance_pricing = pricing_data.get(recommendation.instance_type)
+        if not instance_pricing:
+            raise ValueError(f"No pricing data for instance type {recommendation.instance_type}")
+        
+        # Calculate compute costs based on pricing model (now uses real AWS Savings Plans pricing)
+        compute_cost = await self._calculate_compute_cost(
+            instance_pricing, 
+            tco_parameters, 
+            spec.workload_type
+        )
+        
+        # Calculate storage costs
+        storage_cost = self._calculate_storage_cost(
+            spec.storage_gb, 
+            storage_pricing, 
+            tco_parameters
+        )
+        
+        # Calculate total monthly cost
+        total_monthly = compute_cost + storage_cost
+        
+        return VMCostEstimate(
+            vm_name=spec.vm_name,
+            recommended_instance_type=recommendation.instance_type,
+            monthly_compute_cost=compute_cost,
+            monthly_storage_cost=storage_cost,
+            total_monthly_cost=total_monthly,
+            annual_cost=total_monthly * 12,
+            confidence_score=recommendation.confidence_score,
+            cost_optimization_notes=self._generate_optimization_notes(spec, recommendation, tco_parameters)
+        )
+    
+    def _get_flexible_column_mapping(self, df_columns: List[str]) -> Dict[str, str]:
+        """Map various possible column names to official RVTools format"""
+        column_mappings = {
+            'vm_name': ['VM', 'Name', 'VM Name', 'Virtual Machine'],
+            'cpu': ['CPUs', 'CPU', 'vCPU', 'CPU Count'],
+            'memory': ['Memory', 'RAM', 'Memory MB', 'RAM MB', 'Memory (MB)', 'Memory MiB'],
+            'storage': ['In Use MiB', 'Provisioned MiB', 'Total disk capacity MiB', 'Provisioned MB'],
+            'storage_used': ['In Use MiB', 'Used MiB', 'In use MiB'],
+            'storage_provisioned': ['Provisioned MiB', 'Total disk capacity MiB', 'Provisioned MB'],
+            'os': ['OS according to the configuration file', 'OS according to the VMware Tools', 'OS', 'Operating System'],
+            'power': ['Powerstate', 'Power State', 'State'],
+            'cluster': ['Cluster', 'Cluster Name'],
+            'host': ['Host', 'ESX Host', 'Host Name'],
+            'datacenter': ['Datacenter', 'Datacenter Name']
+        }
+        
+        found_columns = {}
+        for key, possible_names in column_mappings.items():
+            for col_name in possible_names:
+                if col_name in df_columns:
+                    found_columns[key] = col_name
+                    break
+        
+        logger.info(f"Column mapping detected: {found_columns}")
+        return found_columns
+
+    def _convert_inventory_to_specs(self, vm_inventory: List[Dict]) -> List[VMSpecification]:
+        """
+        Convert VM inventory data to VMSpecification objects using official RVTools column names
+        """
+        vm_specs = []
+        
+        for vm_data in vm_inventory:
+            try:
+                # Extract VM specifications using official RVTools column names
+                vm_name = vm_data.get(RVTOOLS_COLUMNS['vm_name'], vm_data.get('vm_name', 'Unknown'))
+                
+                # CPU cores - use official column name with fallback
+                cpu_cores = int(self._safe_get_numeric_value(
+                    vm_data, RVTOOLS_COLUMNS['cpu_cores'], 2
+                ))
+                
+                # Memory - use official RVTools Memory column (in MiB) with proper conversion
+                memory_mib = self._safe_get_numeric_value(
+                    vm_data, RVTOOLS_COLUMNS['memory_mib'], 4096
+                )
+                memory_gb = self._convert_mib_to_gb(memory_mib)
+                
+                # Storage - use consumed storage (In Use MiB) with fallback to provisioned storage
+                # This provides more accurate rightsizing based on actual usage
+                consumed_storage_mib = self._safe_get_numeric_value(
+                    vm_data, RVTOOLS_COLUMNS['storage_used_mib'], 0
+                )
+                
+                # Fallback to provisioned storage if consumed storage is not available or zero
+                if consumed_storage_mib <= 0:
+                    logger.debug(f"VM {vm_name}: Using provisioned storage as fallback (consumed: {consumed_storage_mib} MiB)")
+                    storage_mib = self._safe_get_numeric_value(
+                        vm_data, RVTOOLS_COLUMNS['storage_provisioned_mib'], 51200  # Default 50GB in MiB
+                    )
+                else:
+                    logger.debug(f"VM {vm_name}: Using consumed storage ({consumed_storage_mib} MiB)")
+                    storage_mib = consumed_storage_mib
+                
+                storage_gb = self._convert_mib_to_gb(storage_mib)
+                
+                # Determine workload type from VM name patterns
+                workload_type = self._determine_workload_type(vm_name)
+                
+                # OS type - use official RVTools OS column
+                os_column_value = vm_data.get(RVTOOLS_COLUMNS['os_type'], '')
+                os_type = "windows" if "windows" in os_column_value.lower() else "linux"
+                
+                vm_spec = VMSpecification(
+                    vm_name=vm_name,
+                    cpu_cores=cpu_cores,
+                    memory_gb=memory_gb,
+                    storage_gb=storage_gb,
+                    workload_type=workload_type,
+                    os_type=os_type
+                )
+                
+                vm_specs.append(vm_spec)
+                
+                logger.debug(f"Converted VM {vm_name}: {cpu_cores} vCPU, {memory_gb:.1f} GB RAM, {storage_gb:.1f} GB storage, OS: {os_type}")
+                
+            except Exception as e:
+                logger.warning(f"Failed to parse VM data: {vm_data}. Error: {e}")
+                # Create default spec for failed parsing
+                vm_specs.append(VMSpecification(
+                    vm_name=vm_data.get(RVTOOLS_COLUMNS['vm_name'], 'Unknown'),
+                    cpu_cores=2,
+                    memory_gb=4,
+                    storage_gb=50,
+                    workload_type=WorkloadType.PRODUCTION,
+                    os_type="linux"
+                ))
+        
+        logger.info(f"Converted {len(vm_specs)} VM specifications")
+        return vm_specs
+    
+    def _determine_workload_type(self, vm_name: str) -> WorkloadType:
+        """
+        Determine workload type from VM name patterns
+        """
+        vm_name_lower = vm_name.lower()
+        
+        if any(keyword in vm_name_lower for keyword in ['prod', 'production', 'prd']):
+            return WorkloadType.PRODUCTION
+        elif any(keyword in vm_name_lower for keyword in ['dev', 'development', 'devel']):
+            return WorkloadType.DEVELOPMENT
+        elif any(keyword in vm_name_lower for keyword in ['test', 'testing', 'tst', 'qa']):
+            return WorkloadType.TESTING
+        elif any(keyword in vm_name_lower for keyword in ['stage', 'staging', 'stg']):
+            return WorkloadType.STAGING
+        else:
+            return WorkloadType.PRODUCTION  # Default to production for safety
+    
+    async def _calculate_detailed_estimates(
+        self,
+        vm_specs: List[VMSpecification],
+        recommendations: List[InstanceRecommendation],
+        pricing_data: Dict[str, InstancePricing],
+        storage_pricing: StoragePricing,
+        tco_parameters: TCOParameters
+    ) -> List[VMCostEstimate]:
+        """
+        Calculate detailed cost estimates for each VM
+        """
+        detailed_estimates = []
+        
+        for vm_spec, recommendation in zip(vm_specs, recommendations):
+            try:
+                instance_pricing = pricing_data[recommendation.instance_type]
+                
+                # Determine pricing plan based on workload type and RI parameters
+                pricing_plan, hourly_rate = self._determine_pricing_plan(
+                    vm_spec, 
+                    instance_pricing, 
+                    tco_parameters
+                )
+                
+                # Calculate EC2 monthly cost (24 hours * 30.44 days average)
+                hours_per_month = 24 * 30.44
+                ec2_monthly_cost = hourly_rate * hours_per_month
+                
+                # DEBUG: Log cost calculation details
+                logger.info(f"Cost calculation for {vm_spec.vm_name}:")
+                logger.info(f"  Instance type: {recommendation.instance_type}")
+                logger.info(f"  Pricing plan: {pricing_plan}")
+                logger.info(f"  Hourly rate: ${hourly_rate:.4f}")
+                logger.info(f"  Hours per month: {hours_per_month:.2f}")
+                logger.info(f"  EC2 monthly cost: ${ec2_monthly_cost:.2f}")
+                
+                # Calculate storage monthly cost
+                storage_monthly_cost = vm_spec.storage_gb * storage_pricing.price_per_gb_month
+                
+                # DEBUG: Log storage calculation details
+                logger.info(f"  Storage GB: {vm_spec.storage_gb:.2f}")
+                logger.info(f"  Storage price per GB: ${storage_pricing.price_per_gb_month:.4f}")
+                logger.info(f"  Storage monthly cost: ${storage_monthly_cost:.2f}")
+                
+                # Total monthly cost for this VM
+                total_monthly_cost = ec2_monthly_cost + storage_monthly_cost
+                
+                logger.info(f"  Total monthly cost: ${total_monthly_cost:.2f}")
+                
+                estimate = VMCostEstimate(
+                    vm_name=vm_spec.vm_name,
+                    current_cpu=vm_spec.cpu_cores,
+                    current_ram_gb=vm_spec.memory_gb,
+                    current_storage_gb=vm_spec.storage_gb,
+                    recommended_instance_family=recommendation.instance_family.value,
+                    recommended_instance_size=recommendation.instance_type,
+                    pricing_plan=pricing_plan,
+                    workload_type=vm_spec.workload_type.value,
+                    ec2_monthly_cost=ec2_monthly_cost,
+                    storage_monthly_cost=storage_monthly_cost,
+                    total_monthly_cost=total_monthly_cost
+                )
+                
+                detailed_estimates.append(estimate)
+                
+            except Exception as e:
+                logger.error(f"Failed to calculate cost for VM {vm_spec.vm_name}: {e}")
+                # Add default estimate for failed calculations
+                detailed_estimates.append(VMCostEstimate(
+                    vm_name=vm_spec.vm_name,
+                    current_cpu=vm_spec.cpu_cores,
+                    current_ram_gb=vm_spec.memory_gb,
+                    current_storage_gb=vm_spec.storage_gb,
+                    recommended_instance_family="general_purpose",
+                    recommended_instance_size="m5.large",
+                    pricing_plan="on_demand",
+                    workload_type=vm_spec.workload_type.value,
+                    ec2_monthly_cost=100.0,  # Default estimate
+                    storage_monthly_cost=vm_spec.storage_gb * 0.08,
+                    total_monthly_cost=100.0 + (vm_spec.storage_gb * 0.08)
+                ))
+        
+        logger.info(f"Calculated detailed estimates for {len(detailed_estimates)} VMs")
+        return detailed_estimates
+    
+    def _determine_pricing_plan(
+        self, 
+        vm_spec: VMSpecification, 
+        instance_pricing: InstancePricing, 
+        tco_parameters: TCOParameters
+    ) -> Tuple[str, float]:
+        """
+        Determine optimal pricing plan and hourly rate for a VM based on pricing_model parameter
+        
+        Pricing Model Logic:
+        - on_demand: All VMs use On-Demand pricing
+        - reserved: All VMs use Reserved pricing (1yr/3yr based on production_ri_years)
+        - mixed: Production VMs use 3-year Reserved, Non-Production VMs use On-Demand
+        """
+        pricing_model = getattr(tco_parameters, 'pricing_model', 'mixed')
+        
+        logger.info(f"Determining pricing for {vm_spec.vm_name}: model={pricing_model}, workload={vm_spec.workload_type}")
+        
+        if pricing_model == "on_demand":
+            # All VMs use On-Demand pricing
+            logger.info(f"  → On-Demand pricing: ${instance_pricing.on_demand_hourly:.4f}/hour")
+            return "on_demand", instance_pricing.on_demand_hourly
+            
+        elif pricing_model == "reserved":
+            # All VMs use Reserved pricing based on production_ri_years setting
+            if tco_parameters.production_ri_years == 3 and instance_pricing.reserved_3yr_hourly:
+                logger.info(f"  → Reserved 3yr pricing: ${instance_pricing.reserved_3yr_hourly:.4f}/hour")
+                return "reserved_3yr", instance_pricing.reserved_3yr_hourly
+            elif tco_parameters.production_ri_years >= 1 and instance_pricing.reserved_1yr_hourly:
+                logger.info(f"  → Reserved 1yr pricing: ${instance_pricing.reserved_1yr_hourly:.4f}/hour")
+                return "reserved_1yr", instance_pricing.reserved_1yr_hourly
+            else:
+                # Fallback to On-Demand if Reserved pricing not available
+                logger.warning(f"  → Reserved pricing not available, falling back to On-Demand")
+                return "on_demand", instance_pricing.on_demand_hourly
+                
+        elif pricing_model == "mixed":
+            # Mixed pricing: Production VMs use 3-year Reserved, Non-Production use On-Demand
+            if vm_spec.workload_type == WorkloadType.PRODUCTION:
+                # Production workloads ALWAYS use 3-year Reserved in Mixed mode
+                if instance_pricing.reserved_3yr_hourly:
+                    logger.info(f"  → Mixed: Production VM using 3yr Reserved: ${instance_pricing.reserved_3yr_hourly:.4f}/hour")
+                    return "reserved_3yr", instance_pricing.reserved_3yr_hourly
+                elif instance_pricing.reserved_1yr_hourly:
+                    # Fallback to 1yr if 3yr not available
+                    logger.info(f"  → Mixed: Production VM using 1yr Reserved (3yr not available): ${instance_pricing.reserved_1yr_hourly:.4f}/hour")
+                    return "reserved_1yr", instance_pricing.reserved_1yr_hourly
+                else:
+                    # Fallback to On-Demand if no Reserved pricing available
+                    logger.warning(f"  → Mixed: Production VM using On-Demand (Reserved not available)")
+                    return "on_demand", instance_pricing.on_demand_hourly
+            else:
+                # Non-production workloads ALWAYS use On-Demand in Mixed mode
+                logger.info(f"  → Mixed: Non-Production VM using On-Demand: ${instance_pricing.on_demand_hourly:.4f}/hour")
+                return "on_demand", instance_pricing.on_demand_hourly
+        
+        else:
+            # Invalid pricing model, fallback to On-Demand
+            logger.warning(f"Invalid pricing model '{pricing_model}', falling back to On-Demand")
+            return "on_demand", instance_pricing.on_demand_hourly
+    
+    def _calculate_cost_summary(
+        self, 
+        detailed_estimates: List[VMCostEstimate], 
+        tco_parameters: TCOParameters
+    ) -> CostSummary:
+        """
+        Calculate overall cost summary from detailed estimates
+        """
+        # Sum up infrastructure costs
+        infrastructure_monthly_cost = sum(estimate.total_monthly_cost for estimate in detailed_estimates)
+        
+        # Calculate additional costs
+        network_monthly_cost = 0.0
+        observability_monthly_cost = 0.0
+        
+        if tco_parameters.include_network:
+            network_monthly_cost = infrastructure_monthly_cost * (tco_parameters.network_cost_percentage / 100)
+        
+        if tco_parameters.include_observability:
+            observability_monthly_cost = infrastructure_monthly_cost * (tco_parameters.observability_cost_percentage / 100)
+        
+        # Total monthly cost
+        total_monthly_cost = infrastructure_monthly_cost + network_monthly_cost + observability_monthly_cost
+        
+        # Annual cost
+        total_annual_cost = total_monthly_cost * 12
+        
+        return CostSummary(
+            infrastructure_monthly_cost=infrastructure_monthly_cost,
+            network_monthly_cost=network_monthly_cost,
+            observability_monthly_cost=observability_monthly_cost,
+            total_monthly_cost=total_monthly_cost,
+            total_annual_cost=total_annual_cost
+        )
+    
+    async def recalculate_with_parameters(
+        self, 
+        session_id: str, 
+        existing_analysis: CostEstimatesAnalysis, 
+        new_parameters: TCOParameters
+    ) -> CostEstimatesAnalysis:
+        """
+        Recalculate costs with new TCO parameters without re-fetching pricing
+        """
+        logger.info(f"Recalculating costs for session {session_id} with new parameters")
+        
+        try:
+            # Update detailed estimates with new pricing plans
+            updated_estimates = []
+            
+            for estimate in existing_analysis.detailed_estimates:
+                # Get the instance pricing (from cache if available)
+                try:
+                    instance_pricing = await self.pricing_service.get_instance_pricing(
+                        estimate.recommended_instance_size, 
+                        new_parameters.target_region
+                    )
+                    
+                    # Create temporary VM spec for pricing plan determination
+                    vm_spec = VMSpecification(
+                        vm_name=estimate.vm_name,
+                        cpu_cores=estimate.current_cpu,
+                        memory_gb=estimate.current_ram_gb,
+                        storage_gb=estimate.current_storage_gb,
+                        workload_type=self._determine_workload_type(estimate.vm_name)
+                    )
+                    
+                    # Recalculate with new parameters
+                    pricing_plan, hourly_rate = self._determine_pricing_plan(
+                        vm_spec, 
+                        instance_pricing, 
+                        new_parameters
+                    )
+                    
+                    # Recalculate costs
+                    hours_per_month = 24 * 30.44
+                    ec2_monthly_cost = hourly_rate * hours_per_month
+                    total_monthly_cost = ec2_monthly_cost + estimate.storage_monthly_cost
+                    
+                    # Update estimate
+                    updated_estimate = VMCostEstimate(
+                        vm_name=estimate.vm_name,
+                        current_cpu=estimate.current_cpu,
+                        current_ram_gb=estimate.current_ram_gb,
+                        current_storage_gb=estimate.current_storage_gb,
+                        recommended_instance_family=estimate.recommended_instance_family,
+                        recommended_instance_size=estimate.recommended_instance_size,
+                        pricing_plan=pricing_plan,
+                        workload_type=vm_spec.workload_type.value,
+                        ec2_monthly_cost=ec2_monthly_cost,
+                        storage_monthly_cost=estimate.storage_monthly_cost,
+                        total_monthly_cost=total_monthly_cost
+                    )
+                    
+                    updated_estimates.append(updated_estimate)
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to recalculate cost for {estimate.vm_name}: {e}")
+                    # Keep original estimate if recalculation fails
+                    updated_estimates.append(estimate)
+            
+            # Recalculate cost summary
+            cost_summary = self._calculate_cost_summary(updated_estimates, new_parameters)
+            
+            # Create updated analysis
+            updated_analysis = CostEstimatesAnalysis(
+                session_id=session_id,
+                tco_parameters=new_parameters,
+                cost_summary=cost_summary,
+                detailed_estimates=updated_estimates,
+                total_vms_analyzed=existing_analysis.total_vms_analyzed
+            )
+            
+            logger.info(f"Cost recalculation completed: ${cost_summary.total_monthly_cost:.2f}/month")
+            return updated_analysis
+            
+        except Exception as e:
+            logger.error(f"Cost recalculation failed for session {session_id}: {e}")
+            raise RuntimeError(f"Cost recalculation failed: {e}")
+    
+    def get_cost_breakdown_by_workload(self, analysis: CostEstimatesAnalysis) -> Dict[str, Dict]:
+        """
+        Get cost breakdown by workload type
+        """
+        workload_costs = {}
+        
+        for estimate in analysis.detailed_estimates:
+            workload_type = self._determine_workload_type(estimate.vm_name).value
+            
+            if workload_type not in workload_costs:
+                workload_costs[workload_type] = {
+                    "vm_count": 0,
+                    "total_monthly_cost": 0.0,
+                    "ec2_monthly_cost": 0.0,
+                    "storage_monthly_cost": 0.0,
+                    "average_cost_per_vm": 0.0
+                }
+            
+            workload_costs[workload_type]["vm_count"] += 1
+            workload_costs[workload_type]["total_monthly_cost"] += estimate.total_monthly_cost
+            workload_costs[workload_type]["ec2_monthly_cost"] += estimate.ec2_monthly_cost
+            workload_costs[workload_type]["storage_monthly_cost"] += estimate.storage_monthly_cost
+        
+        # Calculate averages
+        for workload_type, costs in workload_costs.items():
+            if costs["vm_count"] > 0:
+                costs["average_cost_per_vm"] = costs["total_monthly_cost"] / costs["vm_count"]
+        
+        return workload_costs
+    
+    def get_cost_breakdown_by_instance_family(self, analysis: CostEstimatesAnalysis) -> Dict[str, Dict]:
+        """
+        Get cost breakdown by instance family
+        """
+        family_costs = {}
+        
+        for estimate in analysis.detailed_estimates:
+            family = estimate.recommended_instance_family
+            
+            if family not in family_costs:
+                family_costs[family] = {
+                    "vm_count": 0,
+                    "total_monthly_cost": 0.0,
+                    "average_cost_per_vm": 0.0,
+                    "instance_types": set()
+                }
+            
+            family_costs[family]["vm_count"] += 1
+            family_costs[family]["total_monthly_cost"] += estimate.total_monthly_cost
+            family_costs[family]["instance_types"].add(estimate.recommended_instance_size)
+        
+        # Calculate averages and convert sets to lists
+        for family, costs in family_costs.items():
+            if costs["vm_count"] > 0:
+                costs["average_cost_per_vm"] = costs["total_monthly_cost"] / costs["vm_count"]
+            costs["instance_types"] = list(costs["instance_types"])
+        
+        return family_costs
+    
+    async def calculate_vm_cost_estimate(
+        self, 
+        vm_spec: VMSpecification, 
+        tco_parameters: TCOParameters,
+        recommendation: Optional[InstanceRecommendation] = None,
+        vm_data: Optional[Dict] = None
+    ) -> VMCostEstimate:
+        """
+        Calculate cost estimate for a single VM with enhanced error handling and regional validation
+        
+        This method now includes regional instance type validation and automatic alternatives
+        """
+        logger.info(f"Calculating enhanced cost estimate for VM: {vm_spec.vm_name}")
+        
+        try:
+            # Get instance recommendation if not provided
+            if not recommendation:
+                recommendation = self.recommendation_service.recommend_instance(vm_spec)
+                logger.debug(f"Generated recommendation for {vm_spec.vm_name}: {recommendation.instance_type}")
+            
+            # NEW: Regional instance validation and alternative selection
+            from services.regional_instance_service import get_regional_instance_service
+            regional_service = get_regional_instance_service(self.pricing_service)
+            
+            # Get regional recommendation (validates availability and finds alternatives)
+            regional_rec = await regional_service.get_regional_recommendation(
+                recommendation.instance_type, 
+                tco_parameters.target_region
+            )
+            
+            # Use the regionally validated instance type
+            final_instance_type = regional_rec['recommended_instance']
+            
+            if not final_instance_type:
+                # No alternatives available - create fallback estimate
+                logger.warning(f"No available instance alternatives for {recommendation.instance_type} in {tco_parameters.target_region}")
+                return self._create_fallback_cost_estimate(
+                    vm_spec, 
+                    f"Instance type {recommendation.instance_type} not available in {tco_parameters.target_region}"
+                )
+            
+            # Log instance substitution if applicable
+            if final_instance_type != recommendation.instance_type:
+                logger.info(f"Instance substitution for {vm_spec.vm_name}: {recommendation.instance_type} → {final_instance_type} ({regional_rec['reason']})")
+            
+            # Get pricing data with the validated instance type
+            instance_pricing = await self.pricing_service.get_instance_pricing(
+                final_instance_type, 
+                tco_parameters.target_region
+            )
+            
+            if not instance_pricing:
+                raise ValueError(f"No pricing data available for instance type {final_instance_type} in region {tco_parameters.target_region}")
+            
+            # Get storage pricing with caching
+            storage_pricing = await self.pricing_service.get_storage_pricing(
+                "gp3", 
+                tco_parameters.target_region
+            )
+            
+            # Calculate compute costs with enhanced pricing models and OS detection (now uses real AWS Savings Plans pricing)
+            compute_cost = await self._calculate_compute_cost(
+                instance_pricing, 
+                tco_parameters, 
+                vm_spec.workload_type,
+                vm_data  # Pass VM data for OS detection
+            )
+            
+            # Calculate storage costs
+            storage_cost = self._calculate_storage_cost(
+                vm_spec.storage_gb, 
+                storage_pricing, 
+                tco_parameters
+            )
+            
+            # Calculate total monthly cost
+            total_monthly = compute_cost + storage_cost
+            
+            # Generate optimization notes (include regional substitution info)
+            optimization_notes = self._generate_optimization_notes(vm_spec, recommendation, tco_parameters)
+            
+            # Add regional substitution note if applicable
+            if final_instance_type != recommendation.instance_type:
+                substitution_note = f"Instance type substituted: {recommendation.instance_type} → {final_instance_type} ({regional_rec['reason']})"
+                optimization_notes.insert(0, substitution_note)
+            
+            # Create detailed cost estimate
+            cost_estimate = VMCostEstimate(
+                vm_name=vm_spec.vm_name,
+                current_cpu=vm_spec.cpu_cores,
+                current_ram_gb=vm_spec.memory_gb,
+                current_storage_gb=vm_spec.storage_gb,
+                recommended_instance_family=recommendation.instance_family.value if hasattr(recommendation, 'instance_family') else "general_purpose",
+                recommended_instance_size=final_instance_type,  # Use final instance type
+                pricing_plan=await self._get_pricing_plan_name(instance_pricing, tco_parameters, vm_spec.workload_type),
+                workload_type=vm_spec.workload_type.value,
+                ec2_monthly_cost=compute_cost,
+                storage_monthly_cost=storage_cost,
+                total_monthly_cost=total_monthly
+            )
+            
+            # Add optimization notes as a separate attribute if the model supports it
+            if hasattr(cost_estimate, 'cost_optimization_notes'):
+                cost_estimate.cost_optimization_notes = optimization_notes
+            
+            logger.info(f"Cost estimate calculated for {vm_spec.vm_name}: ${total_monthly:.2f}/month (Instance: {final_instance_type})")
+            return cost_estimate
+            
+        except Exception as e:
+            logger.error(f"Failed to calculate cost estimate for VM {vm_spec.vm_name}: {e}")
+            # Return fallback estimate to prevent complete failure
+            return self._create_fallback_cost_estimate(vm_spec, str(e))
+            total_monthly = compute_cost + storage_cost
+            
+            # Generate optimization notes
+            optimization_notes = self._generate_optimization_notes(vm_spec, recommendation, tco_parameters)
+            
+            # Create detailed cost estimate
+            cost_estimate = VMCostEstimate(
+                vm_name=vm_spec.vm_name,
+                recommended_instance_type=recommendation.instance_type,
+                monthly_compute_cost=compute_cost,
+                monthly_storage_cost=storage_cost,
+                total_monthly_cost=total_monthly,
+                annual_cost=total_monthly * 12,
+                confidence_score=recommendation.confidence_score,
+                cost_optimization_notes=optimization_notes,
+                # Additional fields for compatibility
+                current_cpu=vm_spec.cpu_cores,
+                current_ram_gb=vm_spec.memory_gb,
+                current_storage_gb=vm_spec.storage_gb,
+                recommended_instance_family=recommendation.instance_family.value if hasattr(recommendation, 'instance_family') else "general_purpose",
+                recommended_instance_size=recommendation.instance_type,
+                pricing_plan=await self._get_pricing_plan_name(instance_pricing, tco_parameters, vm_spec.workload_type),
+                workload_type=vm_spec.workload_type.value,
+                ec2_monthly_cost=compute_cost,
+                storage_monthly_cost=storage_cost
+            )
+            
+            logger.info(f"Cost estimate calculated for {vm_spec.vm_name}: ${total_monthly:.2f}/month")
+            return cost_estimate
+            
+        except Exception as e:
+            logger.error(f"Failed to calculate cost estimate for VM {vm_spec.vm_name}: {e}")
+            # Return fallback estimate to prevent complete failure
+            return self._create_fallback_cost_estimate(vm_spec, str(e))
+    
+    def get_cost_summary(
+        self, 
+        detailed_estimates: List[VMCostEstimate], 
+        tco_parameters: TCOParameters
+    ) -> CostSummary:
+        """
+        Generate comprehensive cost summary from detailed VM estimates
+        
+        This method is required for Phase 1 completion and provides aggregated cost analysis
+        with breakdown by workload types, instance families, and additional AWS services.
+        """
+        logger.info(f"Generating cost summary for {len(detailed_estimates)} VM estimates")
+        
+        try:
+            if not detailed_estimates:
+                logger.warning("No detailed estimates provided for cost summary")
+                return self._create_empty_cost_summary()
+            
+            # Calculate base infrastructure costs
+            total_compute_cost = sum(est.monthly_compute_cost for est in detailed_estimates)
+            total_storage_cost = sum(est.monthly_storage_cost for est in detailed_estimates)
+            infrastructure_monthly_cost = total_compute_cost + total_storage_cost
+            
+            # Calculate additional service costs based on TCO parameters
+            network_monthly_cost = 0.0
+            observability_monthly_cost = 0.0
+            backup_monthly_cost = 0.0
+            security_monthly_cost = 0.0
+            
+            # Network costs (VPC, NAT Gateway, Load Balancers, etc.)
+            if getattr(tco_parameters, 'include_network', False):
+                network_percentage = getattr(tco_parameters, 'network_cost_percentage', 10.0)
+                network_monthly_cost = infrastructure_monthly_cost * (network_percentage / 100)
+                logger.debug(f"Network costs: {network_percentage}% of infrastructure = ${network_monthly_cost:.2f}")
+            
+            # Observability costs (CloudWatch, X-Ray, etc.)
+            if getattr(tco_parameters, 'include_observability', False):
+                observability_percentage = getattr(tco_parameters, 'observability_cost_percentage', 5.0)
+                observability_monthly_cost = infrastructure_monthly_cost * (observability_percentage / 100)
+                logger.debug(f"Observability costs: {observability_percentage}% of infrastructure = ${observability_monthly_cost:.2f}")
+            
+            # Backup costs (AWS Backup, EBS snapshots)
+            if getattr(tco_parameters, 'include_backup', False):
+                backup_percentage = getattr(tco_parameters, 'backup_cost_percentage', 3.0)
+                backup_monthly_cost = total_storage_cost * (backup_percentage / 100)
+                logger.debug(f"Backup costs: {backup_percentage}% of storage = ${backup_monthly_cost:.2f}")
+            
+            # Security costs (GuardDuty, Security Hub, etc.)
+            if getattr(tco_parameters, 'include_security', False):
+                security_percentage = getattr(tco_parameters, 'security_cost_percentage', 2.0)
+                security_monthly_cost = infrastructure_monthly_cost * (security_percentage / 100)
+                logger.debug(f"Security costs: {security_percentage}% of infrastructure = ${security_monthly_cost:.2f}")
+            
+            # Calculate totals
+            total_monthly_cost = (
+                infrastructure_monthly_cost + 
+                network_monthly_cost + 
+                observability_monthly_cost + 
+                backup_monthly_cost + 
+                security_monthly_cost
+            )
+            total_annual_cost = total_monthly_cost * 12
+            
+            # Generate cost breakdown by workload type
+            workload_breakdown = self._calculate_workload_cost_breakdown(detailed_estimates)
+            
+            # Generate cost breakdown by instance family
+            instance_family_breakdown = self._calculate_instance_family_breakdown(detailed_estimates)
+            
+            # Calculate cost optimization metrics
+            optimization_metrics = self._calculate_optimization_metrics(detailed_estimates, tco_parameters)
+            
+            # Create comprehensive cost summary
+            cost_summary = CostSummary(
+                # Core costs
+                infrastructure_monthly_cost=infrastructure_monthly_cost,
+                compute_monthly_cost=total_compute_cost,
+                storage_monthly_cost=total_storage_cost,
+                
+                # Additional service costs
+                network_monthly_cost=network_monthly_cost,
+                observability_monthly_cost=observability_monthly_cost,
+                backup_monthly_cost=backup_monthly_cost,
+                security_monthly_cost=security_monthly_cost,
+                
+                # Totals
+                total_monthly_cost=total_monthly_cost,
+                total_annual_cost=total_annual_cost,
+                
+                # Breakdowns and metrics
+                workload_breakdown=workload_breakdown,
+                instance_family_breakdown=instance_family_breakdown,
+                optimization_metrics=optimization_metrics,
+                
+                # Summary statistics
+                total_vms=len(detailed_estimates),
+                average_cost_per_vm=total_monthly_cost / len(detailed_estimates) if detailed_estimates else 0.0,
+                
+                # Cost distribution
+                cost_distribution={
+                    "compute_percentage": (total_compute_cost / total_monthly_cost * 100) if total_monthly_cost > 0 else 0,
+                    "storage_percentage": (total_storage_cost / total_monthly_cost * 100) if total_monthly_cost > 0 else 0,
+                    "additional_services_percentage": ((total_monthly_cost - infrastructure_monthly_cost) / total_monthly_cost * 100) if total_monthly_cost > 0 else 0
+                }
+            )
+            
+            logger.info(f"Cost summary generated: ${total_monthly_cost:.2f}/month (${total_annual_cost:.2f}/year) for {len(detailed_estimates)} VMs")
+            return cost_summary
+            
+        except Exception as e:
+            logger.error(f"Failed to generate cost summary: {e}")
+            # Return fallback summary to prevent complete failure
+            return self._create_fallback_cost_summary(detailed_estimates, str(e))
+    
+    async def _calculate_compute_cost(
+        self, 
+        instance_pricing: InstancePricing, 
+        tco_parameters: TCOParameters, 
+        workload_type: WorkloadType,
+        vm_data: Optional[Dict] = None
+    ) -> float:
+        """Enhanced compute cost calculation with real AWS Savings Plans pricing"""
+        
+        # Detect OS type from VM data if available
+        os_type = self._detect_vm_os_type(vm_data) if vm_data else tco_parameters.default_os_type
+        
+        # Determine which pricing model to use based on workload type
+        if workload_type == WorkloadType.PRODUCTION:
+            pricing_model = tco_parameters.production_pricing_model
+            utilization_percent = tco_parameters.production_utilization_percent
+        else:
+            pricing_model = tco_parameters.non_production_pricing_model
+            utilization_percent = tco_parameters.non_production_utilization_percent
+        
+        # Get hourly rate based on pricing model (now uses real AWS Savings Plans pricing)
+        pricing_plan, hourly_rate = await self._get_hourly_rate_for_model(
+            instance_pricing, 
+            pricing_model, 
+            tco_parameters, 
+            workload_type
+        )
+        
+        # Calculate monthly hours with utilization
+        hours_per_month = 24 * 30.44  # Average days per month
+        utilization_factor = utilization_percent / 100.0
+        effective_hours = hours_per_month * utilization_factor
+        
+        # Calculate base monthly cost
+        base_monthly_cost = hourly_rate * effective_hours
+        
+        # Apply OS-specific pricing adjustments
+        os_adjusted_cost = self._apply_os_pricing_adjustment(base_monthly_cost, os_type)
+        
+        logger.debug(f"Enhanced compute cost: {pricing_plan} @ ${hourly_rate:.4f}/hr * {effective_hours:.1f}hrs = ${os_adjusted_cost:.2f} (OS: {os_type})")
+        
+        return os_adjusted_cost
+    
+    async def _get_hourly_rate_for_model(
+        self, 
+        instance_pricing: InstancePricing, 
+        pricing_model: str, 
+        tco_parameters: TCOParameters, 
+        workload_type: WorkloadType
+    ) -> Tuple[str, float]:
+        """Get hourly rate based on enhanced pricing model with real AWS Savings Plans pricing"""
+        
+        if pricing_model == "on_demand":
+            return "On-Demand", instance_pricing.on_demand_hourly
+            
+        elif pricing_model == "reserved":
+            # Use workload-specific RI terms
+            if workload_type == WorkloadType.PRODUCTION:
+                ri_years = tco_parameters.production_ri_years
+            else:
+                ri_years = getattr(tco_parameters, 'non_production_ri_years', 1)
+            
+            if ri_years >= 3 and instance_pricing.reserved_3yr_hourly:
+                return "Reserved Instance (3 Year)", instance_pricing.reserved_3yr_hourly
+            elif ri_years >= 1 and instance_pricing.reserved_1yr_hourly:
+                return "Reserved Instance (1 Year)", instance_pricing.reserved_1yr_hourly
+            else:
+                return "On-Demand (RI Fallback)", instance_pricing.on_demand_hourly
+                
+        elif pricing_model == "compute_savings":
+            # Calculate Compute Savings Plans rate using real AWS API
+            savings_rate = await self._calculate_savings_plans_rate(
+                instance_pricing, 
+                "compute", 
+                tco_parameters
+            )
+            return "Compute Savings Plans", savings_rate
+            
+        elif pricing_model == "ec2_savings":
+            # Calculate EC2 Instance Savings Plans rate using real AWS API
+            savings_rate = await self._calculate_savings_plans_rate(
+                instance_pricing, 
+                "ec2_instance", 
+                tco_parameters
+            )
+            return "EC2 Instance Savings Plans", savings_rate
+        
+        # Default fallback
+        return "On-Demand (Default)", instance_pricing.on_demand_hourly
+    
+    async def _calculate_savings_plans_rate(
+        self, 
+        instance_pricing: InstancePricing, 
+        plan_type: str, 
+        tco_parameters: TCOParameters
+    ) -> float:
+        """Calculate Savings Plans hourly rate using real AWS API pricing"""
+        
+        try:
+            # Extract instance family from instance type (e.g., "m5" from "m5.xlarge")
+            instance_family = instance_pricing.instance_type.split('.')[0]
+            
+            # Get real Savings Plans pricing from AWS API
+            logger.info(f"Fetching real AWS Savings Plans pricing for {instance_pricing.instance_type} in {tco_parameters.target_region}")
+            
+            savings_plans_pricing = await self.pricing_service.get_savings_plans_pricing(
+                instance_family,
+                tco_parameters.target_region,
+                tco_parameters.savings_plan_commitment,
+                tco_parameters.savings_plan_payment
+            )
+            
+            if savings_plans_pricing and len(savings_plans_pricing) > 0:
+                # Use the first matching Savings Plans price
+                savings_plan = savings_plans_pricing[0]
+                
+                # Use the effective hourly rate which includes upfront amortization
+                real_savings_rate = savings_plan.effective_hourly_rate
+                
+                logger.info(f"Real AWS Savings Plans rate: ${real_savings_rate:.4f}/hour (vs On-Demand: ${instance_pricing.on_demand_hourly:.4f})")
+                logger.info(f"Real AWS Savings: {savings_plan.savings_percentage:.1f}% discount")
+                
+                return real_savings_rate
+            else:
+                logger.warning(f"No real AWS Savings Plans pricing found for {instance_family}, falling back to calculated rate")
+                # Fallback to calculated rate using hardcoded discount
+                return self._calculate_savings_plans_rate_fallback(instance_pricing, plan_type, tco_parameters)
+                
+        except Exception as e:
+            logger.error(f"Failed to get real AWS Savings Plans pricing: {e}")
+            logger.info("Falling back to calculated Savings Plans rate")
+            # Fallback to calculated rate using hardcoded discount
+            return self._calculate_savings_plans_rate_fallback(instance_pricing, plan_type, tco_parameters)
+    
+    def _calculate_savings_plans_rate_fallback(
+        self, 
+        instance_pricing: InstancePricing, 
+        plan_type: str, 
+        tco_parameters: TCOParameters
+    ) -> float:
+        """Fallback Savings Plans rate calculation using estimated discounts"""
+        
+        on_demand_rate = instance_pricing.on_demand_hourly
+        discount_factor = self._get_savings_plans_discount_fallback(
+            plan_type, 
+            tco_parameters.savings_plan_commitment, 
+            tco_parameters.savings_plan_payment
+        )
+        
+        savings_rate = on_demand_rate * (1 - discount_factor)
+        logger.debug(f"Fallback Savings Plans: ${on_demand_rate:.4f} * (1 - {discount_factor:.2f}) = ${savings_rate:.4f}")
+        
+        return savings_rate
+    
+    def _get_savings_plans_discount_fallback(self, plan_type: str, commitment: str, payment: str) -> float:
+        """Fallback Savings Plans discount factor based on AWS typical savings"""
+        
+        # Updated discount matrix based on more recent AWS pricing research
+        discount_matrix = {
+            "compute": {
+                "1_year": {"no_upfront": 0.20, "partial_upfront": 0.23, "all_upfront": 0.26},
+                "3_year": {"no_upfront": 0.31, "partial_upfront": 0.34, "all_upfront": 0.37}
+            },
+            "ec2_instance": {
+                "1_year": {"no_upfront": 0.23, "partial_upfront": 0.26, "all_upfront": 0.29},
+                "3_year": {"no_upfront": 0.34, "partial_upfront": 0.37, "all_upfront": 0.40}
+            }
+        }
+        
+        try:
+            return discount_matrix[plan_type][commitment][payment]
+        except KeyError:
+            logger.warning(f"Unknown Savings Plans config: {plan_type}, {commitment}, {payment}")
+            return 0.20  # Default 20% savings (updated from 15%)
+    
+    def _apply_os_pricing_adjustment(self, base_cost: float, os_type: str) -> float:
+        """Apply OS-specific pricing adjustments based on AWS pricing"""
+        
+        os_multipliers = {
+            "linux": 1.0,        # Base pricing
+            "windows": 1.4,      # ~40% more expensive
+            "rhel": 1.2,         # ~20% more expensive  
+            "suse": 1.15,        # ~15% more expensive
+            "ubuntu_pro": 1.05   # ~5% more expensive
+        }
+        
+        multiplier = os_multipliers.get(os_type, 1.0)
+        return base_cost * multiplier
+    
+    def _detect_vm_os_type(self, vm_data: Dict) -> str:
+        """Detect operating system from RVTool VM data using correct column"""
+        
+        if not vm_data:
+            return "linux"
+        
+        # Primary RVTool OS column as specified
+        primary_os_field = "OS according to the configuration file"
+        
+        # Fallback fields in case the primary field is not available
+        fallback_fields = [
+            'os_according_to_the_configuration_file',  # Alternative naming
+            'guest_os', 
+            'os', 
+            'operating_system', 
+            'guest_full_name', 
+            'config_guest_full_name',
+            'guest_os_full_name'
+        ]
+        
+        os_info = ""
+        
+        # Try primary field first
+        if primary_os_field in vm_data and vm_data[primary_os_field]:
+            os_info = str(vm_data[primary_os_field]).lower()
+        else:
+            # Try fallback fields
+            for field in fallback_fields:
+                if field in vm_data and vm_data[field]:
+                    os_info = str(vm_data[field]).lower()
+                    break
+        
+        # Enhanced OS detection logic for RVTool data
+        if 'windows' in os_info:
+            return 'windows'
+        elif 'red hat' in os_info or 'rhel' in os_info:
+            return 'rhel'
+        elif 'suse' in os_info:
+            return 'suse'
+        elif 'ubuntu' in os_info:
+            return 'ubuntu_pro'
+        elif any(indicator in os_info for indicator in ['linux', 'centos', 'debian', 'fedora', 'amazon linux', 'oracle linux']):
+            return 'linux'
+        elif 'freebsd' in os_info or 'bsd' in os_info:
+            return 'linux'  # Treat BSD as Linux for pricing purposes
+        elif 'solaris' in os_info:
+            return 'linux'  # Treat Solaris as Linux for pricing purposes
+        
+        # Default to linux if unknown
+        return 'linux'
+    
+    def _calculate_storage_cost(
+        self, 
+        storage_gb: float, 
+        storage_pricing: StoragePricing, 
+        tco_parameters: TCOParameters
+    ) -> float:
+        """Calculate monthly storage cost with optimization factors"""
+        
+        # Apply storage optimization factor if specified
+        optimization_factor = getattr(tco_parameters, 'storage_optimization_factor', 1.0)
+        optimized_storage_gb = storage_gb * optimization_factor
+        
+        # Calculate base storage cost
+        base_cost = optimized_storage_gb * storage_pricing.price_per_gb_month
+        
+        # Add IOPS costs if high-performance storage is needed
+        iops_cost = 0.0
+        if getattr(tco_parameters, 'high_performance_storage', False):
+            # Assume 3000 baseline IOPS for gp3, additional IOPS at $0.005 per IOPS per month
+            additional_iops = max(0, int(optimized_storage_gb * 10) - 3000)  # 10 IOPS per GB estimate
+            iops_cost = additional_iops * 0.005
+        
+        total_cost = base_cost + iops_cost
+        
+        logger.debug(f"Storage cost calculation: {optimized_storage_gb:.1f}GB * ${storage_pricing.price_per_gb_month:.4f} + ${iops_cost:.2f} IOPS = ${total_cost:.2f}")
+        
+        return total_cost
+    
+    def _determine_pricing_plan_enhanced(
+        self, 
+        instance_pricing: InstancePricing, 
+        tco_parameters: TCOParameters, 
+        workload_type: WorkloadType
+    ) -> Tuple[str, float]:
+        """Enhanced pricing plan determination with comprehensive logic"""
+        
+        pricing_model = getattr(tco_parameters, 'pricing_model', 'mixed')
+        
+        if pricing_model == "on_demand":
+            return "on_demand", instance_pricing.on_demand_hourly
+            
+        elif pricing_model == "reserved":
+            ri_years = getattr(tco_parameters, 'production_ri_years', 1)
+            if ri_years >= 3 and instance_pricing.reserved_3yr_hourly:
+                return "reserved_3yr", instance_pricing.reserved_3yr_hourly
+            elif ri_years >= 1 and instance_pricing.reserved_1yr_hourly:
+                return "reserved_1yr", instance_pricing.reserved_1yr_hourly
+            else:
+                return "on_demand", instance_pricing.on_demand_hourly
+                
+        elif pricing_model == "mixed":
+            if workload_type == WorkloadType.PRODUCTION:
+                if instance_pricing.reserved_3yr_hourly:
+                    return "reserved_3yr", instance_pricing.reserved_3yr_hourly
+                elif instance_pricing.reserved_1yr_hourly:
+                    return "reserved_1yr", instance_pricing.reserved_1yr_hourly
+            return "on_demand", instance_pricing.on_demand_hourly
+            
+        elif pricing_model == "spot":
+            # Use spot pricing if available, fallback to on-demand
+            spot_price = getattr(instance_pricing, 'spot_hourly', None)
+            if spot_price:
+                return "spot", spot_price
+            return "on_demand", instance_pricing.on_demand_hourly
+        
+        return "on_demand", instance_pricing.on_demand_hourly
+    
+    def _get_workload_utilization_factor(self, workload_type: WorkloadType, tco_parameters: TCOParameters) -> float:
+        """Get utilization factor based on workload type"""
+        
+        utilization_factors = {
+            WorkloadType.PRODUCTION: getattr(tco_parameters, 'production_utilization', 0.85),
+            WorkloadType.DEVELOPMENT: getattr(tco_parameters, 'development_utilization', 0.40),
+            WorkloadType.TESTING: getattr(tco_parameters, 'testing_utilization', 0.30),
+            WorkloadType.STAGING: getattr(tco_parameters, 'staging_utilization', 0.50)
+        }
+        
+        return utilization_factors.get(workload_type, 0.70)  # Default 70% utilization
+    
+    async def _get_pricing_plan_name(self, instance_pricing: InstancePricing, tco_parameters: TCOParameters, workload_type: WorkloadType) -> str:
+        """Get pricing plan name using enhanced parameters for compatibility"""
+        
+        # Determine which pricing model to use based on workload type
+        if workload_type == WorkloadType.PRODUCTION:
+            pricing_model = tco_parameters.production_pricing_model
+        else:
+            pricing_model = tco_parameters.non_production_pricing_model
+        
+        # Get the pricing plan name based on the enhanced model (now uses real AWS Savings Plans pricing)
+        pricing_plan, _ = await self._get_hourly_rate_for_model(
+            instance_pricing, 
+            pricing_model, 
+            tco_parameters, 
+            workload_type
+        )
+        
+        return pricing_plan
+    
+    def _generate_optimization_notes(
+        self, 
+        vm_spec: VMSpecification, 
+        recommendation: InstanceRecommendation, 
+        tco_parameters: TCOParameters
+    ) -> List[str]:
+        """Generate cost optimization recommendations"""
+        
+        notes = []
+        
+        # Right-sizing recommendations
+        if hasattr(recommendation, 'cpu_utilization_estimate'):
+            if recommendation.cpu_utilization_estimate < 0.3:
+                notes.append("Consider downsizing: Low CPU utilization expected")
+            elif recommendation.cpu_utilization_estimate > 0.8:
+                notes.append("Monitor performance: High CPU utilization expected")
+        
+        # Storage optimization
+        if vm_spec.storage_gb > 500:
+            notes.append("Consider EBS optimization for large storage volumes")
+        
+        # Reserved Instance recommendations
+        if vm_spec.workload_type == WorkloadType.PRODUCTION:
+            notes.append("Recommended for Reserved Instance savings")
+        
+        # Spot Instance opportunities
+        if vm_spec.workload_type in [WorkloadType.DEVELOPMENT, WorkloadType.TESTING]:
+            notes.append("Consider Spot Instances for additional savings")
+        
+        return notes
+    
+    def _calculate_workload_cost_breakdown(self, detailed_estimates: List[VMCostEstimate]) -> Dict[str, Dict]:
+        """Calculate cost breakdown by workload type"""
+        
+        breakdown = {}
+        
+        for estimate in detailed_estimates:
+            workload = estimate.workload_type
+            
+            if workload not in breakdown:
+                breakdown[workload] = {
+                    "vm_count": 0,
+                    "total_monthly_cost": 0.0,
+                    "compute_cost": 0.0,
+                    "storage_cost": 0.0,
+                    "average_cost_per_vm": 0.0
+                }
+            
+            breakdown[workload]["vm_count"] += 1
+            breakdown[workload]["total_monthly_cost"] += estimate.total_monthly_cost
+            breakdown[workload]["compute_cost"] += estimate.monthly_compute_cost
+            breakdown[workload]["storage_cost"] += estimate.monthly_storage_cost
+        
+        # Calculate averages
+        for workload, data in breakdown.items():
+            if data["vm_count"] > 0:
+                data["average_cost_per_vm"] = data["total_monthly_cost"] / data["vm_count"]
+        
+        return breakdown
+    
+    def _calculate_instance_family_breakdown(self, detailed_estimates: List[VMCostEstimate]) -> Dict[str, Dict]:
+        """Calculate cost breakdown by instance family"""
+        
+        breakdown = {}
+        
+        for estimate in detailed_estimates:
+            family = estimate.recommended_instance_family
+            
+            if family not in breakdown:
+                breakdown[family] = {
+                    "vm_count": 0,
+                    "total_monthly_cost": 0.0,
+                    "instance_types": set(),
+                    "average_cost_per_vm": 0.0
+                }
+            
+            breakdown[family]["vm_count"] += 1
+            breakdown[family]["total_monthly_cost"] += estimate.total_monthly_cost
+            breakdown[family]["instance_types"].add(estimate.recommended_instance_type)
+        
+        # Calculate averages and convert sets to lists
+        for family, data in breakdown.items():
+            if data["vm_count"] > 0:
+                data["average_cost_per_vm"] = data["total_monthly_cost"] / data["vm_count"]
+            data["instance_types"] = list(data["instance_types"])
+        
+        return breakdown
+    
+    def _calculate_optimization_metrics(self, detailed_estimates: List[VMCostEstimate], tco_parameters: TCOParameters) -> Dict[str, float]:
+        """Calculate cost optimization metrics"""
+        
+        total_estimates = len(detailed_estimates)
+        if total_estimates == 0:
+            return {}
+        
+        # Count VMs by pricing plan
+        on_demand_count = sum(1 for est in detailed_estimates if est.pricing_plan == "on_demand")
+        reserved_count = sum(1 for est in detailed_estimates if "reserved" in est.pricing_plan)
+        spot_count = sum(1 for est in detailed_estimates if est.pricing_plan == "spot")
+        
+        # Calculate potential savings with different pricing models
+        total_on_demand_cost = sum(est.total_monthly_cost for est in detailed_estimates if est.pricing_plan == "on_demand")
+        total_reserved_cost = sum(est.total_monthly_cost for est in detailed_estimates if "reserved" in est.pricing_plan)
+        
+        # Estimate potential savings if all production workloads used Reserved Instances
+        production_estimates = [est for est in detailed_estimates if est.workload_type == "production"]
+        potential_ri_savings = len(production_estimates) * 0.30 * 100  # Assume 30% savings with RI
+        
+        return {
+            "on_demand_percentage": (on_demand_count / total_estimates) * 100,
+            "reserved_percentage": (reserved_count / total_estimates) * 100,
+            "spot_percentage": (spot_count / total_estimates) * 100,
+            "potential_annual_ri_savings": potential_ri_savings,
+            "average_confidence_score": sum(est.confidence_score for est in detailed_estimates) / total_estimates,
+            "rightsizing_opportunities": sum(1 for est in detailed_estimates if est.confidence_score < 0.8)
+        }
+    
+    def _create_fallback_cost_estimate(self, vm_spec: VMSpecification, error_message: str) -> VMCostEstimate:
+        """Create fallback cost estimate when calculation fails"""
+        
+        # Use basic estimation based on VM size
+        base_hourly_cost = max(0.05, vm_spec.cpu_cores * 0.02 + vm_spec.memory_gb * 0.01)
+        monthly_compute = base_hourly_cost * 24 * 30.44
+        monthly_storage = vm_spec.storage_gb * 0.08  # $0.08 per GB for gp3
+        
+        return VMCostEstimate(
+            vm_name=vm_spec.vm_name,
+            recommended_instance_type="m5.large",  # Default fallback
+            monthly_compute_cost=monthly_compute,
+            monthly_storage_cost=monthly_storage,
+            total_monthly_cost=monthly_compute + monthly_storage,
+            annual_cost=(monthly_compute + monthly_storage) * 12,
+            confidence_score=0.3,  # Low confidence for fallback
+            cost_optimization_notes=[f"Fallback estimate due to error: {error_message}"],
+            current_cpu=vm_spec.cpu_cores,
+            current_ram_gb=vm_spec.memory_gb,
+            current_storage_gb=vm_spec.storage_gb,
+            recommended_instance_family="general_purpose",
+            recommended_instance_size="m5.large",
+            pricing_plan="on_demand",
+            workload_type=vm_spec.workload_type.value,
+            ec2_monthly_cost=monthly_compute,
+            storage_monthly_cost=monthly_storage
+        )
+    
+    def _create_empty_cost_summary(self) -> CostSummary:
+        """Create empty cost summary when no estimates are available"""
+        
+        return CostSummary(
+            infrastructure_monthly_cost=0.0,
+            compute_monthly_cost=0.0,
+            storage_monthly_cost=0.0,
+            network_monthly_cost=0.0,
+            observability_monthly_cost=0.0,
+            backup_monthly_cost=0.0,
+            security_monthly_cost=0.0,
+            total_monthly_cost=0.0,
+            total_annual_cost=0.0,
+            workload_breakdown={},
+            instance_family_breakdown={},
+            optimization_metrics={},
+            total_vms=0,
+            average_cost_per_vm=0.0,
+            cost_distribution={"compute_percentage": 0, "storage_percentage": 0, "additional_services_percentage": 0}
+        )
+    
+    def _create_fallback_cost_summary(self, detailed_estimates: List[VMCostEstimate], error_message: str) -> CostSummary:
+        """Create fallback cost summary when calculation fails"""
+        
+        if not detailed_estimates:
+            return self._create_empty_cost_summary()
+        
+        # Calculate basic totals from available estimates
+        total_monthly = sum(est.total_monthly_cost for est in detailed_estimates)
+        
+        return CostSummary(
+            infrastructure_monthly_cost=total_monthly,
+            compute_monthly_cost=total_monthly * 0.8,  # Estimate 80% compute
+            storage_monthly_cost=total_monthly * 0.2,  # Estimate 20% storage
+            network_monthly_cost=0.0,
+            observability_monthly_cost=0.0,
+            backup_monthly_cost=0.0,
+            security_monthly_cost=0.0,
+            total_monthly_cost=total_monthly,
+            total_annual_cost=total_monthly * 12,
+            workload_breakdown={},
+            instance_family_breakdown={},
+            optimization_metrics={"error": error_message},
+            total_vms=len(detailed_estimates),
+            average_cost_per_vm=total_monthly / len(detailed_estimates) if detailed_estimates else 0.0,
+            cost_distribution={"compute_percentage": 80, "storage_percentage": 20, "additional_services_percentage": 0}
+        )
+    
+    # ============================================================================
+    # PHASE 2.1: SAVINGS PLANS INTEGRATION
+    # ============================================================================
+    
+    async def analyze_savings_plans_opportunities(
+        self,
+        session_id: str,
+        detailed_estimates: List[VMCostEstimate],
+        tco_parameters: TCOParameters
+    ) -> Dict[str, Any]:
+        """
+        Analyze Savings Plans opportunities for existing cost estimates
+        Phase 2.1 feature: Advanced pricing optimization
+        """
+        logger.info(f"Analyzing Savings Plans opportunities for session {session_id}")
+        
+        try:
+            # Import savings plans service
+            from .savings_plans_service import savings_plans_service
+            
+            # Convert detailed estimates to VM inventory format for analysis
+            vm_inventory = self._convert_estimates_to_inventory(detailed_estimates)
+            
+            # Calculate current monthly spend from estimates
+            current_monthly_spend = sum(est.total_monthly_cost for est in detailed_estimates)
+            
+            # Analyze Savings Plans opportunities
+            savings_portfolio = await savings_plans_service.analyze_savings_opportunities(
+                vm_inventory, tco_parameters, current_monthly_spend
+            )
+            
+            # Calculate enhanced savings metrics
+            savings_analysis = self._calculate_enhanced_savings_metrics(
+                detailed_estimates, savings_portfolio, tco_parameters
+            )
+            
+            # Generate Savings Plans recommendations
+            recommendations = self._generate_savings_plans_recommendations(
+                savings_portfolio, current_monthly_spend
+            )
+            
+            return {
+                "session_id": session_id,
+                "current_monthly_spend": current_monthly_spend,
+                "current_annual_spend": current_monthly_spend * 12,
+                "savings_portfolio": savings_portfolio,
+                "savings_analysis": savings_analysis,
+                "recommendations": recommendations,
+                "analysis_timestamp": datetime.utcnow(),
+                "total_potential_annual_savings": savings_portfolio.total_annual_savings,
+                "potential_savings_percentage": savings_portfolio.overall_savings_percentage
+            }
+            
+        except Exception as e:
+            logger.error(f"Savings Plans analysis failed for session {session_id}: {e}")
+            raise RuntimeError(f"Savings Plans analysis failed: {e}")
+    
+    def _convert_estimates_to_inventory(self, detailed_estimates: List[VMCostEstimate]) -> List[Dict]:
+        """Convert cost estimates back to VM inventory format for Savings Plans analysis"""
+        
+        vm_inventory = []
+        
+        for estimate in detailed_estimates:
+            # Reconstruct VM data from cost estimate
+            vm_data = {
+                "VM": estimate.vm_name,
+                "CPUs": estimate.current_cpu,
+                "Memory": estimate.current_ram_gb * 1024,  # Convert GB to MB
+                "Powerstate": "poweredOn",  # Assume powered on if in estimates
+                "recommended_instance_type": estimate.recommended_instance_type,
+                "workload_type": estimate.workload_type
+            }
+            vm_inventory.append(vm_data)
+        
+        return vm_inventory
+    
+    def _calculate_enhanced_savings_metrics(
+        self,
+        detailed_estimates: List[VMCostEstimate],
+        savings_portfolio: Any,  # SavingsPlansPortfolio
+        tco_parameters: TCOParameters
+    ) -> Dict[str, Any]:
+        """Calculate enhanced savings metrics and analysis"""
+        
+        # Calculate current cost breakdown
+        current_compute_cost = sum(est.monthly_compute_cost for est in detailed_estimates)
+        current_storage_cost = sum(est.monthly_storage_cost for est in detailed_estimates)
+        current_total_cost = current_compute_cost + current_storage_cost
+        
+        # Calculate Savings Plans impact
+        compute_savings = sum(sp.estimated_monthly_savings for sp in savings_portfolio.compute_savings_plans)
+        ec2_savings = sum(sp.estimated_monthly_savings for sp in savings_portfolio.ec2_instance_savings_plans)
+        total_savings = compute_savings + ec2_savings
+        
+        # Calculate new costs with Savings Plans
+        new_compute_cost = current_compute_cost - total_savings
+        new_total_cost = new_compute_cost + current_storage_cost
+        
+        # Calculate ROI metrics
+        total_commitment = savings_portfolio.total_annual_commitment
+        annual_savings = total_savings * 12
+        roi_percentage = (annual_savings / total_commitment * 100) if total_commitment > 0 else 0
+        
+        # Calculate payback period
+        upfront_costs = savings_portfolio.total_upfront_payment
+        payback_months = (upfront_costs / total_savings) if total_savings > 0 else 0
+        
+        # Analyze coverage by workload type
+        workload_coverage = self._analyze_workload_coverage(detailed_estimates, savings_portfolio)
+        
+        # Risk assessment
+        risk_assessment = self._assess_savings_plans_risk(savings_portfolio, tco_parameters)
+        
+        return {
+            "current_costs": {
+                "monthly_compute": current_compute_cost,
+                "monthly_storage": current_storage_cost,
+                "monthly_total": current_total_cost,
+                "annual_total": current_total_cost * 12
+            },
+            "projected_costs_with_savings_plans": {
+                "monthly_compute": new_compute_cost,
+                "monthly_storage": current_storage_cost,
+                "monthly_total": new_total_cost,
+                "annual_total": new_total_cost * 12
+            },
+            "savings_breakdown": {
+                "monthly_compute_savings": compute_savings,
+                "monthly_ec2_savings": ec2_savings,
+                "monthly_total_savings": total_savings,
+                "annual_total_savings": annual_savings,
+                "savings_percentage": (total_savings / current_total_cost * 100) if current_total_cost > 0 else 0
+            },
+            "investment_analysis": {
+                "total_annual_commitment": total_commitment,
+                "total_upfront_payment": upfront_costs,
+                "roi_percentage": roi_percentage,
+                "payback_months": payback_months,
+                "break_even_point": f"{payback_months:.1f} months" if payback_months > 0 else "Immediate"
+            },
+            "coverage_analysis": workload_coverage,
+            "risk_assessment": risk_assessment,
+            "optimization_score": self._calculate_optimization_score(savings_portfolio, current_total_cost)
+        }
+    
+    def _analyze_workload_coverage(self, detailed_estimates: List[VMCostEstimate], savings_portfolio: Any) -> Dict[str, Any]:
+        """Analyze Savings Plans coverage by workload type"""
+        
+        # Group estimates by workload type
+        workload_costs = {}
+        for estimate in detailed_estimates:
+            workload = estimate.workload_type
+            if workload not in workload_costs:
+                workload_costs[workload] = {"vm_count": 0, "monthly_cost": 0.0}
+            workload_costs[workload]["vm_count"] += 1
+            workload_costs[workload]["monthly_cost"] += estimate.total_monthly_cost
+        
+        # Calculate coverage for each workload
+        coverage_analysis = {}
+        total_commitment = savings_portfolio.total_monthly_commitment
+        
+        for workload, costs in workload_costs.items():
+            # Estimate coverage based on workload suitability for Savings Plans
+            if workload == "production":
+                coverage_percentage = min(90, (total_commitment / costs["monthly_cost"]) * 100)
+            elif workload == "staging":
+                coverage_percentage = min(70, (total_commitment / costs["monthly_cost"]) * 100)
+            else:  # development, testing
+                coverage_percentage = min(50, (total_commitment / costs["monthly_cost"]) * 100)
+            
+            coverage_analysis[workload] = {
+                "vm_count": costs["vm_count"],
+                "monthly_cost": costs["monthly_cost"],
+                "coverage_percentage": coverage_percentage,
+                "estimated_monthly_savings": costs["monthly_cost"] * (coverage_percentage / 100) * 0.3,  # Assume 30% savings
+                "suitability": "high" if workload == "production" else "medium" if workload == "staging" else "low"
+            }
+        
+        return coverage_analysis
+    
+    def _assess_savings_plans_risk(self, savings_portfolio: Any, tco_parameters: TCOParameters) -> Dict[str, Any]:
+        """Assess risk factors for Savings Plans recommendations"""
+        
+        risk_factors = []
+        risk_score = savings_portfolio.portfolio_risk_score
+        
+        # Commitment term risk
+        long_term_plans = [sp for sp in savings_portfolio.compute_savings_plans + savings_portfolio.ec2_instance_savings_plans 
+                          if sp.commitment_term == "3_year"]
+        if long_term_plans:
+            risk_factors.append("Long-term commitments (3-year) increase flexibility risk")
+        
+        # Upfront payment risk
+        if savings_portfolio.total_upfront_payment > 10000:
+            risk_factors.append("High upfront payment increases cash flow risk")
+        
+        # Coverage concentration risk
+        if len(savings_portfolio.ec2_instance_savings_plans) == 1:
+            risk_factors.append("Concentration in single instance family increases risk")
+        
+        # Workload stability risk
+        pricing_model = getattr(tco_parameters, 'pricing_model', 'mixed')
+        if pricing_model == "mixed":
+            risk_factors.append("Mixed workloads may have variable utilization patterns")
+        
+        # Generate risk mitigation recommendations
+        mitigation_strategies = []
+        if risk_score > 70:
+            mitigation_strategies.append("Consider shorter commitment terms to reduce risk")
+            mitigation_strategies.append("Start with smaller commitments and scale up")
+        if savings_portfolio.total_upfront_payment > 5000:
+            mitigation_strategies.append("Consider no-upfront or partial-upfront payment options")
+        
+        return {
+            "overall_risk_score": risk_score,
+            "risk_level": "high" if risk_score > 70 else "medium" if risk_score > 40 else "low",
+            "risk_factors": risk_factors,
+            "mitigation_strategies": mitigation_strategies,
+            "diversification_score": savings_portfolio.diversification_score,
+            "recommendation": "Proceed with caution" if risk_score > 70 else "Recommended" if risk_score < 40 else "Consider with monitoring"
+        }
+    
+    def _calculate_optimization_score(self, savings_portfolio: Any, current_monthly_cost: float) -> Dict[str, Any]:
+        """Calculate overall optimization score for Savings Plans portfolio"""
+        
+        # Scoring factors (0-100 each)
+        savings_score = min(100, savings_portfolio.overall_savings_percentage * 2)  # Up to 50% savings = 100 points
+        diversification_score = savings_portfolio.diversification_score
+        risk_score = 100 - savings_portfolio.portfolio_risk_score  # Invert risk (lower risk = higher score)
+        
+        # Weighted overall score
+        overall_score = (savings_score * 0.5) + (diversification_score * 0.3) + (risk_score * 0.2)
+        
+        # Generate grade
+        if overall_score >= 90:
+            grade = "A+"
+        elif overall_score >= 80:
+            grade = "A"
+        elif overall_score >= 70:
+            grade = "B"
+        elif overall_score >= 60:
+            grade = "C"
+        else:
+            grade = "D"
+        
+        return {
+            "overall_score": overall_score,
+            "grade": grade,
+            "component_scores": {
+                "savings_potential": savings_score,
+                "diversification": diversification_score,
+                "risk_management": risk_score
+            },
+            "recommendation": self._get_optimization_recommendation(overall_score, savings_portfolio)
+        }
+    
+    def _get_optimization_recommendation(self, score: float, savings_portfolio: Any) -> str:
+        """Get optimization recommendation based on score"""
+        
+        if score >= 80:
+            return f"Excellent optimization opportunity. Implement recommended Savings Plans for ${savings_portfolio.total_annual_savings:,.0f} annual savings."
+        elif score >= 60:
+            return f"Good optimization potential. Consider implementing with risk monitoring for ${savings_portfolio.total_annual_savings:,.0f} annual savings."
+        else:
+            return "Limited optimization benefit. Consider alternative cost optimization strategies or wait for more stable workload patterns."
+    
+    def _generate_savings_plans_recommendations(self, savings_portfolio: Any, current_monthly_spend: float) -> List[Dict[str, Any]]:
+        """Generate actionable Savings Plans recommendations"""
+        
+        recommendations = []
+        
+        # Immediate action recommendations
+        if savings_portfolio.total_annual_savings > 1000:
+            recommendations.append({
+                "priority": "high",
+                "category": "immediate_savings",
+                "title": "Implement Compute Savings Plans",
+                "description": f"Start with Compute Savings Plans to save ${savings_portfolio.total_annual_savings:,.0f} annually",
+                "action_items": [
+                    "Review workload stability over past 3 months",
+                    "Start with conservative 70% commitment level",
+                    "Monitor utilization for first month"
+                ],
+                "estimated_savings": savings_portfolio.total_annual_savings,
+                "implementation_effort": "low",
+                "risk_level": "low"
+            })
+        
+        # Instance family optimization
+        if len(savings_portfolio.ec2_instance_savings_plans) > 0:
+            top_family_plan = max(savings_portfolio.ec2_instance_savings_plans, 
+                                key=lambda x: x.estimated_annual_savings)
+            recommendations.append({
+                "priority": "medium",
+                "category": "instance_optimization",
+                "title": f"Optimize {top_family_plan.instance_family} Instance Family",
+                "description": f"EC2 Instance Savings Plans for {top_family_plan.instance_family} family can save ${top_family_plan.estimated_annual_savings:,.0f} annually",
+                "action_items": [
+                    f"Analyze {top_family_plan.instance_family} instance usage patterns",
+                    "Consider 1-year commitment initially",
+                    "Monitor instance type flexibility needs"
+                ],
+                "estimated_savings": top_family_plan.estimated_annual_savings,
+                "implementation_effort": "medium",
+                "risk_level": "medium"
+            })
+        
+        # Long-term optimization
+        three_year_plans = [sp for sp in savings_portfolio.compute_savings_plans + savings_portfolio.ec2_instance_savings_plans 
+                           if sp.commitment_term == "3_year"]
+        if three_year_plans:
+            total_3yr_savings = sum(sp.estimated_annual_savings for sp in three_year_plans)
+            recommendations.append({
+                "priority": "low",
+                "category": "long_term_optimization",
+                "title": "Consider 3-Year Commitments for Maximum Savings",
+                "description": f"3-year commitments can provide additional ${total_3yr_savings - savings_portfolio.total_annual_savings:,.0f} in savings",
+                "action_items": [
+                    "Evaluate long-term business stability",
+                    "Assess workload growth projections",
+                    "Consider gradual migration to longer terms"
+                ],
+                "estimated_savings": total_3yr_savings - savings_portfolio.total_annual_savings,
+                "implementation_effort": "high",
+                "risk_level": "high"
+            })
+        
+        # Risk mitigation recommendations
+        if savings_portfolio.portfolio_risk_score > 60:
+            recommendations.append({
+                "priority": "medium",
+                "category": "risk_management",
+                "title": "Implement Risk Mitigation Strategies",
+                "description": "High portfolio risk requires careful monitoring and mitigation",
+                "action_items": [
+                    "Start with shorter commitment terms",
+                    "Diversify across multiple instance families",
+                    "Implement utilization monitoring"
+                ],
+                "estimated_savings": 0,
+                "implementation_effort": "medium",
+                "risk_level": "low"
+            })
+        
+        return recommendations
+
+    # ============================================================================
+    # PHASE 2.2: RESERVED INSTANCE INTEGRATION
+    # ============================================================================
+    
+    async def analyze_reserved_instance_opportunities(
+        self,
+        session_id: str,
+        detailed_estimates: List[VMCostEstimate],
+        tco_parameters: TCOParameters
+    ) -> Dict[str, Any]:
+        """
+        Analyze Reserved Instance opportunities for existing cost estimates
+        Phase 2.2 feature: Comprehensive RI optimization
+        """
+        logger.info(f"Analyzing Reserved Instance opportunities for session {session_id}")
+        
+        try:
+            # Import reserved instance service
+            from .reserved_instance_service import reserved_instance_service
+            
+            # Convert detailed estimates to VM inventory format
+            vm_inventory = self._convert_estimates_to_inventory(detailed_estimates)
+            
+            # Calculate current monthly spend
+            current_monthly_spend = sum(est.total_monthly_cost for est in detailed_estimates)
+            
+            # Analyze RI opportunities
+            ri_portfolio = await reserved_instance_service.analyze_ri_opportunities(
+                session_id, vm_inventory, tco_parameters, current_monthly_spend
+            )
+            
+            # Calculate enhanced RI metrics
+            ri_analysis = self._calculate_enhanced_ri_metrics(
+                detailed_estimates, ri_portfolio, tco_parameters
+            )
+            
+            # Generate RI implementation roadmap
+            implementation_roadmap = self._generate_ri_implementation_roadmap(
+                ri_portfolio, current_monthly_spend
+            )
+            
+            # Compare with Savings Plans (if available)
+            comparison_analysis = await self._compare_ri_with_savings_plans(
+                session_id, detailed_estimates, tco_parameters, ri_portfolio
+            )
+            
+            return {
+                "session_id": session_id,
+                "current_monthly_spend": current_monthly_spend,
+                "current_annual_spend": current_monthly_spend * 12,
+                "ri_portfolio": ri_portfolio,
+                "ri_analysis": ri_analysis,
+                "implementation_roadmap": implementation_roadmap,
+                "comparison_analysis": comparison_analysis,
+                "analysis_timestamp": datetime.utcnow(),
+                "total_potential_annual_savings": ri_portfolio.total_annual_savings,
+                "potential_savings_percentage": ri_portfolio.portfolio_savings_percentage
+            }
+            
+        except Exception as e:
+            logger.error(f"Reserved Instance analysis failed for session {session_id}: {e}")
+            raise RuntimeError(f"Reserved Instance analysis failed: {e}")
+    
+    def _calculate_enhanced_ri_metrics(
+        self,
+        detailed_estimates: List[VMCostEstimate],
+        ri_portfolio: Any,  # RIPortfolio
+        tco_parameters: TCOParameters
+    ) -> Dict[str, Any]:
+        """Calculate enhanced RI metrics and analysis"""
+        
+        # Calculate current cost breakdown
+        current_compute_cost = sum(est.monthly_compute_cost for est in detailed_estimates)
+        current_storage_cost = sum(est.monthly_storage_cost for est in detailed_estimates)
+        current_total_cost = current_compute_cost + current_storage_cost
+        
+        # Calculate RI impact
+        total_ri_savings = ri_portfolio.total_annual_savings / 12  # Monthly savings
+        new_compute_cost = current_compute_cost - total_ri_savings
+        new_total_cost = new_compute_cost + current_storage_cost
+        
+        # Calculate ROI metrics
+        total_investment = ri_portfolio.total_upfront_investment
+        annual_savings = ri_portfolio.total_annual_savings
+        roi_percentage = (annual_savings / total_investment * 100) if total_investment > 0 else 0
+        
+        # Calculate payback period
+        monthly_savings = total_ri_savings
+        payback_months = (total_investment / monthly_savings) if monthly_savings > 0 else 0
+        
+        # Analyze coverage by term
+        one_year_coverage = self._analyze_ri_term_coverage(ri_portfolio.one_year_recommendations, detailed_estimates)
+        three_year_coverage = self._analyze_ri_term_coverage(ri_portfolio.three_year_recommendations, detailed_estimates)
+        
+        # Risk assessment
+        risk_assessment = self._assess_ri_portfolio_risk(ri_portfolio, tco_parameters)
+        
+        # Cash flow analysis
+        cash_flow_analysis = self._analyze_ri_cash_flow_impact(ri_portfolio, current_total_cost)
+        
+        return {
+            "current_costs": {
+                "monthly_compute": current_compute_cost,
+                "monthly_storage": current_storage_cost,
+                "monthly_total": current_total_cost,
+                "annual_total": current_total_cost * 12
+            },
+            "projected_costs_with_ri": {
+                "monthly_compute": new_compute_cost,
+                "monthly_storage": current_storage_cost,
+                "monthly_total": new_total_cost,
+                "annual_total": new_total_cost * 12
+            },
+            "ri_investment_analysis": {
+                "total_upfront_investment": total_investment,
+                "monthly_savings": monthly_savings,
+                "annual_savings": annual_savings,
+                "roi_percentage": roi_percentage,
+                "payback_months": payback_months,
+                "break_even_point": f"{payback_months:.1f} months" if payback_months > 0 else "Immediate"
+            },
+            "coverage_analysis": {
+                "one_year_coverage": one_year_coverage,
+                "three_year_coverage": three_year_coverage,
+                "total_instances_covered": len(ri_portfolio.one_year_recommendations) + len(ri_portfolio.three_year_recommendations),
+                "coverage_percentage": ri_portfolio.portfolio_savings_percentage
+            },
+            "risk_assessment": risk_assessment,
+            "cash_flow_analysis": cash_flow_analysis,
+            "optimization_score": self._calculate_ri_optimization_score(ri_portfolio, current_total_cost)
+        }
+    
+    def _analyze_ri_term_coverage(self, recommendations: List[Any], detailed_estimates: List[VMCostEstimate]) -> Dict[str, Any]:
+        """Analyze RI coverage by term"""
+        
+        if not recommendations:
+            return {"recommendation_count": 0, "total_savings": 0.0, "average_savings_percentage": 0.0}
+        
+        total_savings = sum(rec.estimated_annual_savings for rec in recommendations)
+        total_investment = sum(rec.total_upfront_cost for rec in recommendations)
+        
+        return {
+            "recommendation_count": len(recommendations),
+            "total_annual_savings": total_savings,
+            "total_upfront_investment": total_investment,
+            "average_savings_percentage": sum(rec.savings_percentage for rec in recommendations) / len(recommendations),
+            "average_payback_months": sum(rec.payback_period_months for rec in recommendations) / len(recommendations),
+            "risk_distribution": {
+                "low": sum(1 for rec in recommendations if rec.risk_level == "low"),
+                "medium": sum(1 for rec in recommendations if rec.risk_level == "medium"),
+                "high": sum(1 for rec in recommendations if rec.risk_level == "high")
+            }
+        }
+    
+    def _assess_ri_portfolio_risk(self, ri_portfolio: Any, tco_parameters: TCOParameters) -> Dict[str, Any]:
+        """Assess risk factors for RI portfolio"""
+        
+        risk_factors = []
+        risk_score = ri_portfolio.portfolio_risk_score
+        
+        # Investment concentration risk
+        if ri_portfolio.total_upfront_investment > 50000:
+            risk_factors.append("High upfront investment increases cash flow risk")
+        
+        # Term concentration risk
+        three_year_ratio = len(ri_portfolio.three_year_recommendations) / max(1, ri_portfolio.total_recommendations)
+        if three_year_ratio > 0.7:
+            risk_factors.append("High concentration in 3-year terms increases commitment risk")
+        
+        # Payment option risk
+        all_upfront_ratio = ri_portfolio.all_upfront_total / max(1, ri_portfolio.total_upfront_investment)
+        if all_upfront_ratio > 0.8:
+            risk_factors.append("High all-upfront payment concentration increases liquidity risk")
+        
+        # Diversification risk
+        if ri_portfolio.diversification_score < 50:
+            risk_factors.append("Low diversification increases portfolio risk")
+        
+        # Generate mitigation strategies
+        mitigation_strategies = []
+        if risk_score > 70:
+            mitigation_strategies.extend([
+                "Consider phased implementation over 6-12 months",
+                "Start with 1-year terms and upgrade to 3-year after validation",
+                "Maintain 30% on-demand capacity for flexibility"
+            ])
+        
+        if ri_portfolio.total_upfront_investment > 25000:
+            mitigation_strategies.append("Evaluate partial-upfront options to reduce cash flow impact")
+        
+        return {
+            "overall_risk_score": risk_score,
+            "risk_level": "high" if risk_score > 70 else "medium" if risk_score > 40 else "low",
+            "risk_factors": risk_factors,
+            "mitigation_strategies": mitigation_strategies,
+            "diversification_score": ri_portfolio.diversification_score,
+            "liquidity_impact": ri_portfolio.liquidity_impact,
+            "recommendation": "Proceed with caution" if risk_score > 70 else "Recommended" if risk_score < 40 else "Consider with monitoring"
+        }
+    
+    def _analyze_ri_cash_flow_impact(self, ri_portfolio: Any, current_monthly_cost: float) -> Dict[str, Any]:
+        """Analyze cash flow impact of RI portfolio"""
+        
+        # Calculate monthly cash flow changes
+        monthly_upfront_amortization = ri_portfolio.total_upfront_investment / 12  # Spread over 1 year for analysis
+        monthly_recurring_changes = (ri_portfolio.total_annual_savings / 12) - monthly_upfront_amortization
+        
+        # Payment option breakdown
+        payment_breakdown = {
+            "no_upfront": {
+                "amount": ri_portfolio.no_upfront_total,
+                "monthly_impact": 0.0,  # No immediate cash flow impact
+                "percentage": (ri_portfolio.no_upfront_total / max(1, ri_portfolio.total_upfront_investment)) * 100
+            },
+            "partial_upfront": {
+                "amount": ri_portfolio.partial_upfront_total,
+                "monthly_impact": ri_portfolio.partial_upfront_total / 12,
+                "percentage": (ri_portfolio.partial_upfront_total / max(1, ri_portfolio.total_upfront_investment)) * 100
+            },
+            "all_upfront": {
+                "amount": ri_portfolio.all_upfront_total,
+                "monthly_impact": ri_portfolio.all_upfront_total,  # Full impact in month 1
+                "percentage": (ri_portfolio.all_upfront_total / max(1, ri_portfolio.total_upfront_investment)) * 100
+            }
+        }
+        
+        # Calculate break-even timeline
+        cumulative_savings = 0.0
+        break_even_months = 0
+        monthly_savings = ri_portfolio.total_annual_savings / 12
+        
+        while cumulative_savings < ri_portfolio.total_upfront_investment and break_even_months < 60:
+            break_even_months += 1
+            cumulative_savings += monthly_savings
+        
+        return {
+            "upfront_investment_required": ri_portfolio.total_upfront_investment,
+            "monthly_savings_after_break_even": monthly_savings,
+            "net_monthly_impact_year_1": monthly_recurring_changes,
+            "break_even_months": break_even_months,
+            "payment_option_breakdown": payment_breakdown,
+            "cash_flow_recommendation": self._generate_cash_flow_recommendation(
+                ri_portfolio.total_upfront_investment, monthly_savings, current_monthly_cost
+            )
+        }
+    
+    def _generate_cash_flow_recommendation(
+        self, 
+        upfront_investment: float, 
+        monthly_savings: float, 
+        current_monthly_cost: float
+    ) -> str:
+        """Generate cash flow recommendation"""
+        
+        investment_ratio = upfront_investment / (current_monthly_cost * 12) if current_monthly_cost > 0 else 0
+        
+        if investment_ratio > 0.5:
+            return "High upfront investment - consider phased implementation or partial-upfront options"
+        elif investment_ratio > 0.25:
+            return "Moderate upfront investment - ensure adequate cash reserves before implementation"
+        else:
+            return "Low cash flow impact - suitable for immediate implementation"
+    
+    def _calculate_ri_optimization_score(self, ri_portfolio: Any, current_monthly_cost: float) -> Dict[str, Any]:
+        """Calculate overall RI optimization score"""
+        
+        # Scoring factors (0-100 each)
+        savings_score = min(100, ri_portfolio.portfolio_savings_percentage * 2)  # Up to 50% savings = 100 points
+        diversification_score = ri_portfolio.diversification_score
+        risk_score = 100 - ri_portfolio.portfolio_risk_score  # Invert risk (lower risk = higher score)
+        
+        # Weighted overall score
+        overall_score = (savings_score * 0.5) + (diversification_score * 0.3) + (risk_score * 0.2)
+        
+        # Generate grade
+        if overall_score >= 90:
+            grade = "A+"
+        elif overall_score >= 80:
+            grade = "A"
+        elif overall_score >= 70:
+            grade = "B"
+        elif overall_score >= 60:
+            grade = "C"
+        else:
+            grade = "D"
+        
+        return {
+            "overall_score": overall_score,
+            "grade": grade,
+            "component_scores": {
+                "savings_potential": savings_score,
+                "diversification": diversification_score,
+                "risk_management": risk_score
+            },
+            "recommendation": self._get_ri_optimization_recommendation(overall_score, ri_portfolio)
+        }
+    
+    def _get_ri_optimization_recommendation(self, score: float, ri_portfolio: Any) -> str:
+        """Get RI optimization recommendation based on score"""
+        
+        if score >= 80:
+            return f"Excellent RI optimization opportunity. Implement recommended portfolio for ${ri_portfolio.total_annual_savings:,.0f} annual savings."
+        elif score >= 60:
+            return f"Good RI optimization potential. Consider phased implementation for ${ri_portfolio.total_annual_savings:,.0f} annual savings."
+        else:
+            return "Limited RI optimization benefit. Focus on workload stabilization before implementing Reserved Instances."
+    
+    def _generate_ri_implementation_roadmap(self, ri_portfolio: Any, current_monthly_spend: float) -> Dict[str, Any]:
+        """Generate RI implementation roadmap"""
+        
+        roadmap = {
+            "phase_1": {
+                "title": "Initial RI Implementation (Month 1-2)",
+                "actions": [
+                    "Implement highest-confidence 1-year RI recommendations",
+                    "Start with no-upfront or partial-upfront payment options",
+                    "Focus on production workloads with >80% stability"
+                ],
+                "target_savings": ri_portfolio.total_annual_savings * 0.4,
+                "investment_required": ri_portfolio.total_upfront_investment * 0.3,
+                "risk_level": "low"
+            },
+            "phase_2": {
+                "title": "Portfolio Expansion (Months 3-6)",
+                "actions": [
+                    "Add remaining 1-year RI recommendations",
+                    "Evaluate 3-year RIs for highly stable workloads",
+                    "Implement utilization monitoring and optimization"
+                ],
+                "target_savings": ri_portfolio.total_annual_savings * 0.4,
+                "investment_required": ri_portfolio.total_upfront_investment * 0.5,
+                "risk_level": "medium"
+            },
+            "phase_3": {
+                "title": "Advanced Optimization (Months 6-12)",
+                "actions": [
+                    "Implement 3-year RIs for validated stable workloads",
+                    "Optimize payment options based on cash flow",
+                    "Consider convertible RIs for additional flexibility"
+                ],
+                "target_savings": ri_portfolio.total_annual_savings * 0.2,
+                "investment_required": ri_portfolio.total_upfront_investment * 0.2,
+                "risk_level": "medium"
+            }
+        }
+        
+        return roadmap
+    
+    async def _compare_ri_with_savings_plans(
+        self,
+        session_id: str,
+        detailed_estimates: List[VMCostEstimate],
+        tco_parameters: TCOParameters,
+        ri_portfolio: Any
+    ) -> Dict[str, Any]:
+        """Compare RI recommendations with Savings Plans"""
+        
+        try:
+            # Get Savings Plans analysis if available
+            savings_plans_analysis = await self.analyze_savings_plans_opportunities(
+                session_id, detailed_estimates, tco_parameters
+            )
+            
+            sp_portfolio = savings_plans_analysis["savings_portfolio"]
+            
+            # Compare key metrics
+            comparison = {
+                "savings_comparison": {
+                    "ri_annual_savings": ri_portfolio.total_annual_savings,
+                    "sp_annual_savings": sp_portfolio.total_annual_savings,
+                    "better_option": "Reserved Instances" if ri_portfolio.total_annual_savings > sp_portfolio.total_annual_savings else "Savings Plans"
+                },
+                "investment_comparison": {
+                    "ri_upfront_investment": ri_portfolio.total_upfront_investment,
+                    "sp_upfront_investment": sp_portfolio.total_upfront_payment,
+                    "lower_investment": "Reserved Instances" if ri_portfolio.total_upfront_investment < sp_portfolio.total_upfront_payment else "Savings Plans"
+                },
+                "flexibility_comparison": {
+                    "ri_flexibility_score": 100 - ri_portfolio.portfolio_risk_score,  # Lower risk = higher flexibility
+                    "sp_flexibility_score": sp_portfolio.diversification_score,
+                    "more_flexible": "Savings Plans"  # Generally more flexible
+                },
+                "hybrid_recommendation": self._generate_hybrid_recommendation(ri_portfolio, sp_portfolio)
+            }
+            
+            return comparison
+            
+        except Exception as e:
+            logger.warning(f"Could not compare with Savings Plans: {e}")
+            return {
+                "comparison_available": False,
+                "reason": "Savings Plans analysis not available"
+            }
+    
+    def _generate_hybrid_recommendation(self, ri_portfolio: Any, sp_portfolio: Any) -> Dict[str, Any]:
+        """Generate hybrid RI + Savings Plans recommendation"""
+        
+        # Calculate optimal mix
+        total_potential_savings = ri_portfolio.total_annual_savings + sp_portfolio.total_annual_savings
+        
+        # Recommend hybrid approach if both have significant savings
+        if ri_portfolio.total_annual_savings > 1000 and sp_portfolio.total_annual_savings > 1000:
+            return {
+                "recommended_approach": "hybrid",
+                "strategy": "Combine Reserved Instances for stable workloads with Savings Plans for variable workloads",
+                "allocation": {
+                    "ri_percentage": 60,  # 60% RI for stable production workloads
+                    "sp_percentage": 40   # 40% Savings Plans for flexible workloads
+                },
+                "expected_total_savings": total_potential_savings * 0.8,  # Account for some overlap
+                "implementation_priority": [
+                    "Start with Compute Savings Plans for immediate flexibility",
+                    "Implement 1-year RIs for highly stable workloads",
+                    "Add 3-year RIs after 6 months of validation"
+                ]
+            }
+        elif ri_portfolio.total_annual_savings > sp_portfolio.total_annual_savings:
+            return {
+                "recommended_approach": "ri_focused",
+                "strategy": "Focus on Reserved Instances with Savings Plans as supplement",
+                "primary_savings": ri_portfolio.total_annual_savings,
+                "secondary_savings": sp_portfolio.total_annual_savings * 0.3
+            }
+        else:
+            return {
+                "recommended_approach": "sp_focused",
+                "strategy": "Focus on Savings Plans with Reserved Instances for specific stable workloads",
+                "primary_savings": sp_portfolio.total_annual_savings,
+                "secondary_savings": ri_portfolio.total_annual_savings * 0.3
+            }
+
+    # ============================================================================
+    # PHASE 2.3: SPOT INSTANCE INTEGRATION
+    # ============================================================================
+    
+    async def analyze_spot_instance_opportunities(
+        self,
+        session_id: str,
+        detailed_estimates: List[VMCostEstimate],
+        tco_parameters: TCOParameters
+    ) -> Dict[str, Any]:
+        """
+        Analyze Spot Instance opportunities for existing cost estimates
+        Phase 2.3 feature: Comprehensive Spot Instance optimization
+        """
+        logger.info(f"Analyzing Spot Instance opportunities for session {session_id}")
+        
+        try:
+            # Import spot instance service
+            from .spot_instance_service import spot_instance_service
+            
+            # Convert detailed estimates to VM inventory format
+            vm_inventory = self._convert_estimates_to_inventory(detailed_estimates)
+            
+            # Calculate current monthly spend
+            current_monthly_spend = sum(est.total_monthly_cost for est in detailed_estimates)
+            
+            # Analyze Spot opportunities
+            spot_strategy = await spot_instance_service.analyze_spot_opportunities(
+                session_id, vm_inventory, tco_parameters, current_monthly_spend
+            )
+            
+            # Calculate enhanced Spot metrics
+            spot_analysis = self._calculate_enhanced_spot_metrics(
+                detailed_estimates, spot_strategy, tco_parameters
+            )
+            
+            # Generate Spot implementation roadmap
+            implementation_roadmap = self._generate_spot_implementation_roadmap(
+                spot_strategy, current_monthly_spend
+            )
+            
+            # Compare with other pricing models
+            pricing_comparison = await self._compare_spot_with_other_models(
+                session_id, detailed_estimates, tco_parameters, spot_strategy
+            )
+            
+            return {
+                "session_id": session_id,
+                "current_monthly_spend": current_monthly_spend,
+                "current_annual_spend": current_monthly_spend * 12,
+                "spot_strategy": spot_strategy,
+                "spot_analysis": spot_analysis,
+                "implementation_roadmap": implementation_roadmap,
+                "pricing_comparison": pricing_comparison,
+                "analysis_timestamp": datetime.utcnow(),
+                "total_potential_annual_savings": spot_strategy.annual_savings_projection,
+                "potential_savings_percentage": (spot_strategy.monthly_cost_reduction / current_monthly_spend * 100) if current_monthly_spend > 0 else 0
+            }
+            
+        except Exception as e:
+            logger.error(f"Spot Instance analysis failed for session {session_id}: {e}")
+            raise RuntimeError(f"Spot Instance analysis failed: {e}")
+    
+    def _calculate_enhanced_spot_metrics(
+        self,
+        detailed_estimates: List[VMCostEstimate],
+        spot_strategy: Any,  # SpotOptimizationStrategy
+        tco_parameters: TCOParameters
+    ) -> Dict[str, Any]:
+        """Calculate enhanced Spot Instance metrics and analysis"""
+        
+        # Calculate current cost breakdown
+        current_compute_cost = sum(est.monthly_compute_cost for est in detailed_estimates)
+        current_storage_cost = sum(est.monthly_storage_cost for est in detailed_estimates)
+        current_total_cost = current_compute_cost + current_storage_cost
+        
+        # Calculate Spot impact
+        spot_savings = spot_strategy.monthly_cost_reduction
+        new_compute_cost = current_compute_cost - spot_savings
+        new_total_cost = new_compute_cost + current_storage_cost
+        
+        # Calculate workload suitability analysis
+        workload_suitability = self._analyze_spot_workload_suitability(detailed_estimates, spot_strategy)
+        
+        # Calculate risk assessment
+        risk_assessment = self._assess_spot_strategy_risk(spot_strategy, tco_parameters)
+        
+        # Calculate interruption impact analysis
+        interruption_analysis = self._analyze_interruption_impact(spot_strategy)
+        
+        # Calculate cost-benefit analysis
+        cost_benefit = self._calculate_spot_cost_benefit(spot_strategy, current_total_cost)
+        
+        return {
+            "current_costs": {
+                "monthly_compute": current_compute_cost,
+                "monthly_storage": current_storage_cost,
+                "monthly_total": current_total_cost,
+                "annual_total": current_total_cost * 12
+            },
+            "projected_costs_with_spot": {
+                "monthly_compute": new_compute_cost,
+                "monthly_storage": current_storage_cost,
+                "monthly_total": new_total_cost,
+                "annual_total": new_total_cost * 12
+            },
+            "spot_savings_analysis": {
+                "monthly_savings": spot_savings,
+                "annual_savings": spot_strategy.annual_savings_projection,
+                "savings_percentage": (spot_savings / current_total_cost * 100) if current_total_cost > 0 else 0,
+                "potential_max_savings": spot_strategy.total_potential_savings
+            },
+            "workload_suitability": workload_suitability,
+            "risk_assessment": risk_assessment,
+            "interruption_analysis": interruption_analysis,
+            "cost_benefit_analysis": cost_benefit,
+            "optimization_score": self._calculate_spot_optimization_score(spot_strategy, current_total_cost)
+        }
+    
+    def _analyze_spot_workload_suitability(self, detailed_estimates: List[VMCostEstimate], spot_strategy: Any) -> Dict[str, Any]:
+        """Analyze workload suitability for Spot instances"""
+        
+        # Group estimates by workload type
+        workload_costs = {}
+        for estimate in detailed_estimates:
+            workload = estimate.workload_type
+            if workload not in workload_costs:
+                workload_costs[workload] = {"vm_count": 0, "monthly_cost": 0.0}
+            workload_costs[workload]["vm_count"] += 1
+            workload_costs[workload]["monthly_cost"] += estimate.total_monthly_cost
+        
+        # Calculate suitability for each workload
+        suitability_analysis = {}
+        
+        for workload, costs in workload_costs.items():
+            # Determine suitability based on workload type
+            if workload == "development":
+                suitability_score = 90
+                recommendation = "Highly suitable - minimal business impact from interruptions"
+            elif workload == "testing":
+                suitability_score = 85
+                recommendation = "Very suitable - can handle interruptions well"
+            elif workload == "staging":
+                suitability_score = 70
+                recommendation = "Suitable with proper fault tolerance"
+            else:  # production
+                suitability_score = 40
+                recommendation = "Use with caution - requires robust fault tolerance"
+            
+            # Find matching Spot recommendations
+            matching_recommendations = [
+                rec for rec in spot_strategy.spot_recommendations
+                if workload in rec.workload_suitability
+            ]
+            
+            potential_savings = sum(rec.estimated_monthly_savings for rec in matching_recommendations)
+            
+            suitability_analysis[workload] = {
+                "vm_count": costs["vm_count"],
+                "monthly_cost": costs["monthly_cost"],
+                "suitability_score": suitability_score,
+                "recommendation": recommendation,
+                "potential_monthly_savings": potential_savings,
+                "spot_recommendations_count": len(matching_recommendations)
+            }
+        
+        return suitability_analysis
+    
+    def _assess_spot_strategy_risk(self, spot_strategy: Any, tco_parameters: TCOParameters) -> Dict[str, Any]:
+        """Assess risk factors for Spot strategy"""
+        
+        risk_factors = []
+        risk_score = 0
+        
+        # Overall risk level assessment
+        if spot_strategy.overall_risk_level.value == "very_high":
+            risk_score += 40
+            risk_factors.append("Very high interruption risk across multiple instance types")
+        elif spot_strategy.overall_risk_level.value == "high":
+            risk_score += 30
+            risk_factors.append("High interruption risk requires robust fault tolerance")
+        elif spot_strategy.overall_risk_level.value == "moderate":
+            risk_score += 20
+            risk_factors.append("Moderate interruption risk manageable with proper planning")
+        
+        # Workload distribution risk
+        if len(spot_strategy.target_workload_types) == 1:
+            risk_score += 15
+            risk_factors.append("Limited workload diversification increases risk concentration")
+        
+        # Savings dependency risk
+        if spot_strategy.spot_percentage > 70:
+            risk_score += 20
+            risk_factors.append("High dependency on Spot instances increases operational risk")
+        
+        # Generate mitigation strategies
+        mitigation_strategies = spot_strategy.risk_mitigation_measures.copy()
+        
+        if risk_score > 60:
+            mitigation_strategies.extend([
+                "Consider reducing Spot percentage to 50% or less",
+                "Implement comprehensive monitoring and alerting",
+                "Establish clear escalation procedures for interruptions"
+            ])
+        
+        return {
+            "overall_risk_score": risk_score,
+            "risk_level": "high" if risk_score > 60 else "medium" if risk_score > 30 else "low",
+            "risk_factors": risk_factors,
+            "mitigation_strategies": mitigation_strategies,
+            "interruption_risk_level": spot_strategy.overall_risk_level.value,
+            "recommendation": "Proceed with comprehensive monitoring" if risk_score < 60 else "Implement with caution and reduced scope"
+        }
+    
+    def _analyze_interruption_impact(self, spot_strategy: Any) -> Dict[str, Any]:
+        """Analyze potential impact of Spot instance interruptions"""
+        
+        # Calculate weighted average interruption metrics
+        total_savings = sum(rec.estimated_monthly_savings for rec in spot_strategy.spot_recommendations)
+        
+        if total_savings == 0:
+            return {"analysis_available": False}
+        
+        weighted_avg_runtime = sum(
+            rec.expected_runtime_hours * (rec.estimated_monthly_savings / total_savings)
+            for rec in spot_strategy.spot_recommendations
+        )
+        
+        weighted_avg_frequency = sum(
+            rec.interruption_frequency * (rec.estimated_monthly_savings / total_savings)
+            for rec in spot_strategy.spot_recommendations
+        )
+        
+        # Calculate impact metrics
+        interruptions_per_week = weighted_avg_frequency * 7
+        downtime_percentage = (interruptions_per_week * 0.5) / 168 * 100  # Assume 30 min restart time
+        
+        # Estimate productivity impact
+        if weighted_avg_runtime > 48:  # > 2 days
+            productivity_impact = "Low - Long running tasks minimize restart overhead"
+        elif weighted_avg_runtime > 12:  # > 12 hours
+            productivity_impact = "Medium - Moderate restart overhead"
+        else:
+            productivity_impact = "High - Frequent restarts may impact productivity"
+        
+        return {
+            "analysis_available": True,
+            "average_runtime_hours": weighted_avg_runtime,
+            "interruptions_per_week": interruptions_per_week,
+            "estimated_downtime_percentage": downtime_percentage,
+            "productivity_impact": productivity_impact,
+            "restart_overhead_estimate": "30 minutes average per interruption",
+            "recommendations": [
+                "Implement checkpointing for long-running tasks",
+                "Use job queuing systems for batch processing",
+                "Monitor interruption patterns and adjust bid prices"
+            ]
+        }
+    
+    def _calculate_spot_cost_benefit(self, spot_strategy: Any, current_monthly_cost: float) -> Dict[str, Any]:
+        """Calculate cost-benefit analysis for Spot strategy"""
+        
+        # Calculate implementation costs
+        implementation_cost = current_monthly_cost * 0.05  # Assume 5% implementation overhead
+        monitoring_cost = 100  # Monthly monitoring tools cost
+        
+        # Calculate ongoing operational costs
+        operational_overhead = spot_strategy.monthly_cost_reduction * 0.1  # 10% operational overhead
+        
+        # Calculate net benefit
+        gross_monthly_savings = spot_strategy.monthly_cost_reduction
+        net_monthly_savings = gross_monthly_savings - operational_overhead - monitoring_cost
+        
+        # Calculate payback period
+        payback_months = implementation_cost / net_monthly_savings if net_monthly_savings > 0 else 999
+        
+        # Calculate ROI
+        annual_net_savings = net_monthly_savings * 12
+        roi_percentage = (annual_net_savings / implementation_cost * 100) if implementation_cost > 0 else 0
+        
+        return {
+            "gross_monthly_savings": gross_monthly_savings,
+            "implementation_cost": implementation_cost,
+            "monthly_operational_overhead": operational_overhead,
+            "monthly_monitoring_cost": monitoring_cost,
+            "net_monthly_savings": net_monthly_savings,
+            "annual_net_savings": annual_net_savings,
+            "payback_period_months": payback_months,
+            "roi_percentage": roi_percentage,
+            "break_even_point": f"{payback_months:.1f} months" if payback_months < 999 else "Not achievable",
+            "recommendation": "Highly recommended" if roi_percentage > 200 else "Recommended" if roi_percentage > 100 else "Consider carefully"
+        }
+    
+    def _calculate_spot_optimization_score(self, spot_strategy: Any, current_monthly_cost: float) -> Dict[str, Any]:
+        """Calculate overall Spot optimization score"""
+        
+        # Scoring factors (0-100 each)
+        savings_score = min(100, (spot_strategy.monthly_cost_reduction / current_monthly_cost) * 200) if current_monthly_cost > 0 else 0
+        
+        # Risk score (inverted - lower risk = higher score)
+        risk_mapping = {"very_low": 90, "low": 80, "moderate": 60, "high": 40, "very_high": 20}
+        risk_score = risk_mapping.get(spot_strategy.overall_risk_level.value, 50)
+        
+        # Suitability score based on workload types
+        suitable_workloads = ["development", "testing", "staging"]
+        suitability_score = sum(25 for wt in spot_strategy.target_workload_types if wt in suitable_workloads)
+        suitability_score = min(100, suitability_score)
+        
+        # Weighted overall score
+        overall_score = (savings_score * 0.4) + (risk_score * 0.3) + (suitability_score * 0.3)
+        
+        # Generate grade
+        if overall_score >= 85:
+            grade = "A+"
+        elif overall_score >= 75:
+            grade = "A"
+        elif overall_score >= 65:
+            grade = "B"
+        elif overall_score >= 55:
+            grade = "C"
+        else:
+            grade = "D"
+        
+        return {
+            "overall_score": overall_score,
+            "grade": grade,
+            "component_scores": {
+                "savings_potential": savings_score,
+                "risk_management": risk_score,
+                "workload_suitability": suitability_score
+            },
+            "recommendation": self._get_spot_optimization_recommendation(overall_score, spot_strategy)
+        }
+    
+    def _get_spot_optimization_recommendation(self, score: float, spot_strategy: Any) -> str:
+        """Get Spot optimization recommendation based on score"""
+        
+        if score >= 75:
+            return f"Excellent Spot opportunity. Implement strategy for ${spot_strategy.annual_savings_projection:,.0f} annual savings."
+        elif score >= 60:
+            return f"Good Spot potential. Consider phased implementation for ${spot_strategy.annual_savings_projection:,.0f} annual savings."
+        else:
+            return "Limited Spot benefits. Focus on workload optimization and fault tolerance before implementing Spot instances."
+    
+    def _generate_spot_implementation_roadmap(self, spot_strategy: Any, current_monthly_spend: float) -> Dict[str, Any]:
+        """Generate Spot implementation roadmap"""
+        
+        return {
+            "implementation_phases": spot_strategy.implementation_phases,
+            "timeline_weeks": spot_strategy.timeline_weeks,
+            "success_criteria": spot_strategy.success_criteria,
+            "monitoring_requirements": spot_strategy.monitoring_requirements,
+            "optimization_triggers": spot_strategy.optimization_triggers,
+            "risk_mitigation": spot_strategy.risk_mitigation_measures,
+            "fallback_strategies": spot_strategy.fallback_strategies
+        }
+    
+    async def _compare_spot_with_other_models(
+        self,
+        session_id: str,
+        detailed_estimates: List[VMCostEstimate],
+        tco_parameters: TCOParameters,
+        spot_strategy: Any
+    ) -> Dict[str, Any]:
+        """Compare Spot with other pricing models"""
+        
+        try:
+            comparison = {
+                "spot_analysis": {
+                    "annual_savings": spot_strategy.annual_savings_projection,
+                    "risk_level": spot_strategy.overall_risk_level.value,
+                    "suitability": "fault_tolerant_workloads"
+                }
+            }
+            
+            # Compare with Savings Plans if available
+            try:
+                sp_analysis = await self.analyze_savings_plans_opportunities(
+                    session_id, detailed_estimates, tco_parameters
+                )
+                comparison["savings_plans_analysis"] = {
+                    "annual_savings": sp_analysis["total_potential_annual_savings"],
+                    "risk_level": "low",
+                    "suitability": "all_workloads"
+                }
+            except Exception as e:
+                logger.warning(f"Could not compare with Savings Plans: {e}")
+            
+            # Compare with Reserved Instances if available
+            try:
+                ri_analysis = await self.analyze_reserved_instance_opportunities(
+                    session_id, detailed_estimates, tco_parameters
+                )
+                comparison["reserved_instances_analysis"] = {
+                    "annual_savings": ri_analysis["total_potential_annual_savings"],
+                    "risk_level": "low",
+                    "suitability": "stable_workloads"
+                }
+            except Exception as e:
+                logger.warning(f"Could not compare with Reserved Instances: {e}")
+            
+            # Generate hybrid recommendation
+            comparison["hybrid_recommendation"] = self._generate_hybrid_spot_recommendation(comparison)
+            
+            return comparison
+            
+        except Exception as e:
+            logger.warning(f"Could not perform pricing model comparison: {e}")
+            return {"comparison_available": False, "reason": str(e)}
+    
+    def _generate_hybrid_spot_recommendation(self, comparison: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate hybrid recommendation combining Spot with other pricing models"""
+        
+        spot_savings = comparison["spot_analysis"]["annual_savings"]
+        
+        # Default hybrid approach
+        hybrid = {
+            "recommended_approach": "spot_focused",
+            "spot_percentage": 60,
+            "on_demand_percentage": 40,
+            "strategy": "Use Spot for development/testing, on-demand for production"
+        }
+        
+        # If other pricing models are available, create more sophisticated hybrid
+        if "savings_plans_analysis" in comparison and "reserved_instances_analysis" in comparison:
+            sp_savings = comparison["savings_plans_analysis"]["annual_savings"]
+            ri_savings = comparison["reserved_instances_analysis"]["annual_savings"]
+            
+            total_potential = spot_savings + sp_savings + ri_savings
+            
+            hybrid = {
+                "recommended_approach": "comprehensive_hybrid",
+                "spot_percentage": 30,
+                "savings_plans_percentage": 40,
+                "reserved_instances_percentage": 20,
+                "on_demand_percentage": 10,
+                "strategy": "Spot for fault-tolerant workloads, Savings Plans for flexible capacity, RIs for stable production",
+                "expected_total_savings": total_potential * 0.7,  # Account for overlap
+                "implementation_priority": [
+                    "Start with Savings Plans for immediate flexibility",
+                    "Implement Spot for development and batch workloads",
+                    "Add Reserved Instances for stable production workloads"
+                ]
+            }
+        
+        return hybrid
+
+# Global cost estimates service
+cost_estimates_service = CostEstimatesService()

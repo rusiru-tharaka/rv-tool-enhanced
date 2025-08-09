@@ -1,0 +1,16 @@
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.git
+**/.pytest_cache
+**/.coverage
+**/node_modules
+**/venv
+**/env
+**/.env
+**/logs
+**/tmp
+**/*.log
+**/offline_data
+**/bulk_pricing
