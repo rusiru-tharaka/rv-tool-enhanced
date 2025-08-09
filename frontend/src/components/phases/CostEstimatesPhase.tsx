@@ -38,6 +38,21 @@ const CostEstimatesPhase: React.FC<CostEstimatesPhaseProps> = ({ sessionId }) =>
   const [showParametersForm, setShowParametersForm] = useState(true);
   const [excludedVMCount, setExcludedVMCount] = useState(0);
 
+  // CRITICAL: Monitor state changes to identify data corruption
+  useEffect(() => {
+    if (state.costEstimatesAnalysis?.detailed_estimates) {
+      const prodVM = state.costEstimatesAnalysis.detailed_estimates.find(vm => vm.vm_name === 'erp-gateway-prod76');
+      if (prodVM) {
+        console.log('🔍 [STATE MONITOR] Production VM state change detected:');
+        console.log(`   - Pricing Plan: ${prodVM.pricing_plan}`);
+        console.log(`   - Environment: ${prodVM.environment}`);
+        console.log(`   - Base Cost: ${prodVM.base_instance_cost}`);
+        console.log(`   - Total Cost: ${prodVM.projected_monthly_cost}`);
+        console.log('   - Full Object:', JSON.stringify(prodVM, null, 2));
+      }
+    }
+  }, [state.costEstimatesAnalysis]);
+
   // Helper function to get workload type (prefer backend data, fallback to frontend detection)
   const getWorkloadType = (estimate: any): string => {
     // Use backend workload_type if available
@@ -434,6 +449,36 @@ const CostEstimatesPhase: React.FC<CostEstimatesPhaseProps> = ({ sessionId }) =>
 
   // Additional safety check to ensure we have valid data
   const costAnalysis = state.costEstimatesAnalysis;
+  
+  // COMPREHENSIVE DEBUG LOGGING - REBUILD
+  if (costAnalysis) {
+    console.log('🚀 [REBUILD] Cost Analysis Data Available:');
+    console.log('📊 [REBUILD] Total VMs:', costAnalysis.detailed_estimates?.length || 0);
+    console.log('💰 [REBUILD] Total Monthly Cost:', costAnalysis.cost_summary?.total_monthly_cost);
+    
+    // CRITICAL: Log the raw backend response to identify data corruption
+    console.log('🔍 [CRITICAL] Raw Backend Response Check:');
+    console.log('📋 [CRITICAL] Full costAnalysis object:', JSON.stringify(costAnalysis, null, 2));
+    
+    if (costAnalysis.detailed_estimates) {
+      console.log('🔍 [REBUILD] Detailed VM Analysis:');
+      costAnalysis.detailed_estimates.forEach((vm, index) => {
+        console.log(`   ${index + 1}. ${vm.vm_name}:`);
+        console.log(`      - Instance: ${vm.recommended_instance_type}`);
+        console.log(`      - Pricing: ${vm.pricing_plan}`);
+        console.log(`      - Environment: ${vm.environment}`);
+        console.log(`      - Storage: ${vm.current_storage_gb}GB`);
+        console.log(`      - Cost: $${vm.projected_monthly_cost}`);
+        
+        // CRITICAL: Check for erp-gateway-prod76 specifically
+        if (vm.vm_name === 'erp-gateway-prod76') {
+          console.log('🎯 [CRITICAL] Production VM Data:');
+          console.log('   - Raw VM Object:', JSON.stringify(vm, null, 2));
+        }
+      });
+    }
+  }
+  
   if (!costAnalysis) {
     return (
       <div className="space-y-6">
@@ -733,50 +778,50 @@ const CostEstimatesPhase: React.FC<CostEstimatesPhaseProps> = ({ sessionId }) =>
                   </tr>
                 </thead>
                 <tbody className="bg-white divide-y divide-gray-200">
-                  {costAnalysis.detailed_estimates.slice(0, 10).map((estimate, index) => {
-                    // Use backend data directly - no fallback calculations
-                    const storageGB = estimate.current_storage_gb || 0;
-                    const storageCost = estimate.storage_cost || 0;
-                    const instanceCost = estimate.base_instance_cost || 0;
-                    const totalCost = estimate.projected_monthly_cost || 0;
-                    
-                    // Debug logging for ALL VMs to identify the pricing plan issue
-                    console.log(`🔍 [Cost Estimates] VM ${index + 1}/${costAnalysis.detailed_estimates.length}:`, {
-                      vm_name: estimate.vm_name,
-                      instance_type: estimate.recommended_instance_type,
+                  {costAnalysis.detailed_estimates.map((estimate, index) => {
+                    // Log every single VM to debug the issue
+                    console.log(`🔍 [REBUILD] VM ${index + 1}: ${estimate.vm_name}`, {
                       pricing_plan: estimate.pricing_plan,
                       environment: estimate.environment,
-                      base_instance_cost: estimate.base_instance_cost,
-                      storage_cost: estimate.storage_cost,
-                      projected_monthly_cost: estimate.projected_monthly_cost,
-                      is_production: estimate.environment === 'production'
+                      instance_type: estimate.recommended_instance_type,
+                      base_cost: estimate.base_instance_cost,
+                      storage_gb: estimate.current_storage_gb,
+                      total_cost: estimate.projected_monthly_cost
                     });
                     
                     return (
-                      <tr key={index} className={index % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{estimate.vm_name}</td>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                          {estimate.recommended_instance_type}
+                      <tr key={`vm-${index}-${estimate.vm_name}`} className={index % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                        <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                          {estimate.vm_name || 'Unknown'}
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                          <span className={estimate.pricing_plan?.includes('Reserved') ? 'text-green-600 font-medium' : 'text-blue-600'}>
-                            {estimate.pricing_plan}
+                          {estimate.recommended_instance_type || 'Unknown'}
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                          <span className={
+                            (estimate.pricing_plan && estimate.pricing_plan.includes('Reserved')) 
+                              ? 'text-green-600 font-bold bg-green-50 px-2 py-1 rounded' 
+                              : 'text-blue-600 font-medium bg-blue-50 px-2 py-1 rounded'
+                          }>
+                            {estimate.pricing_plan || 'Unknown'}
                           </span>
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                          <span className="capitalize">{(estimate.operating_system || 'linux').replace('_', ' ')}</span>
+                          <span className="capitalize">
+                            {(estimate.operating_system || 'linux').replace('_', ' ')}
+                          </span>
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                          {storageGB.toLocaleString()} GB
+                          {(estimate.current_storage_gb || 0).toLocaleString(undefined, {maximumFractionDigits: 1})} GB
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                          ${instanceCost.toLocaleString(undefined, {maximumFractionDigits: 2})}
+                          ${(estimate.base_instance_cost || 0).toLocaleString(undefined, {maximumFractionDigits: 2})}
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                          ${storageCost.toLocaleString(undefined, {maximumFractionDigits: 2})}
+                          ${(estimate.storage_cost || 0).toLocaleString(undefined, {maximumFractionDigits: 2})}
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                          ${totalCost.toLocaleString(undefined, {maximumFractionDigits: 2})}
+                          ${(estimate.projected_monthly_cost || 0).toLocaleString(undefined, {maximumFractionDigits: 2})}
                         </td>
                       </tr>
                     );
@@ -819,10 +864,13 @@ const CostEstimatesPhase: React.FC<CostEstimatesPhaseProps> = ({ sessionId }) =>
                     {
                       label: 'Monthly Cost',
                       data: (() => {
-                        // Use backend environment classification directly
-                        const prodVMs = costAnalysis.detailed_estimates.filter(vm => 
-                          vm.environment === 'production'
-                        );
+                        // Use backend environment classification directly - REBUILT
+                        console.log('🔄 [REBUILD] Processing VM classifications...');
+                        
+                        const prodVMs = costAnalysis.detailed_estimates.filter(vm => {
+                          console.log(`🔍 [REBUILD] ${vm.vm_name}: environment="${vm.environment}"`);
+                          return vm.environment === 'production';
+                        });
                         
                         const nonProdVMs = costAnalysis.detailed_estimates.filter(vm => 
                           vm.environment === 'non-production'
@@ -831,20 +879,29 @@ const CostEstimatesPhase: React.FC<CostEstimatesPhaseProps> = ({ sessionId }) =>
                         const prodCost = prodVMs.reduce((sum, vm) => sum + (vm.projected_monthly_cost || 0), 0);
                         const nonProdCost = nonProdVMs.reduce((sum, vm) => sum + (vm.projected_monthly_cost || 0), 0);
                         
-                        console.log(`✅ [Backend Classification] Production VMs: ${prodVMs.length}, Cost: $${prodCost.toFixed(2)}`);
-                        console.log(`✅ [Backend Classification] Non-Production VMs: ${nonProdVMs.length}, Cost: $${nonProdCost.toFixed(2)}`);
+                        console.log('🎯 [REBUILD] Final Classification:');
+                        console.log(`   Production VMs: ${prodVMs.length}, Cost: $${prodCost.toFixed(2)}`);
+                        console.log(`   Non-Production VMs: ${nonProdVMs.length}, Cost: $${nonProdCost.toFixed(2)}`);
+                        
+                        // Log individual production VMs
+                        if (prodVMs.length > 0) {
+                          console.log('🏭 [REBUILD] Production VMs:');
+                          prodVMs.forEach(vm => {
+                            console.log(`   - ${vm.vm_name}: ${vm.pricing_plan} ($${vm.projected_monthly_cost?.toFixed(2)})`);
+                          });
+                        }
                         
                         return [prodCost, nonProdCost];
                       })(),
                       backgroundColor: [
-                        'rgba(54, 162, 235, 0.6)',
-                        'rgba(255, 206, 86, 0.6)',
+                        'rgba(34, 197, 94, 0.6)',  // Green for production
+                        'rgba(59, 130, 246, 0.6)', // Blue for non-production
                       ],
                       borderColor: [
-                        'rgba(54, 162, 235, 1)',
-                        'rgba(255, 206, 86, 1)',
+                        'rgba(34, 197, 94, 1)',
+                        'rgba(59, 130, 246, 1)',
                       ],
-                      borderWidth: 1,
+                      borderWidth: 2,
                     },
                   ],
                 }}

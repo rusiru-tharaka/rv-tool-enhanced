@@ -175,7 +175,7 @@ def calculate_aws_costs(vm_inventory: List[Dict[str, Any]], tco_parameters: Dict
         on_demand_monthly = on_demand_hourly * monthly_hours
         
         # Apply Reserved Instance pricing for production VMs
-        if is_production and tco_parameters.get("production_pricing_model") == "reserved_instance":
+        if is_production and tco_parameters.get("production_pricing_model") in ["reserved_instance", "reserved"]:
             # RI discount rates (approximate)
             ri_discount_rates = {1: 0.25, 3: 0.40, 5: 0.50}  # 25%, 40%, 50% discount
             discount = ri_discount_rates.get(ri_years, 0.40)

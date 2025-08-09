@@ -727,8 +727,8 @@ export function SessionProvider({ children }: SessionProviderProps) {
         throw new Error('No active session found');
       }
 
-      // Prepare TCO parameters with defaults
-      const parameters = tcoParameters || {
+      // Prepare TCO parameters with defaults, but prioritize user selections
+      const defaultParameters = {
         target_region: 'us-east-1',
         production_pricing_model: 'on_demand',
         non_production_pricing_model: 'on_demand',
@@ -747,7 +747,14 @@ export function SessionProvider({ children }: SessionProviderProps) {
         default_os_type: 'linux'
       };
 
-      console.log(`Calling backend API for cost analysis with parameters:`, parameters);
+      // CRITICAL FIX: Merge user parameters with defaults, prioritizing user selections
+      const parameters = {
+        ...defaultParameters,
+        ...tcoParameters  // User parameters override defaults
+      };
+
+      console.log(`🔧 [FIXED] User TCO Parameters:`, tcoParameters);
+      console.log(`🔧 [FIXED] Final Parameters sent to backend:`, parameters);
       console.log(`Session ID: ${sessionId}`);
 
       // Call backend API for real AWS pricing calculation
